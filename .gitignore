@@ -1,2 +1,2 @@
 .env
-environments/*/env.sh
+environments/
