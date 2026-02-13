@@ -7,6 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/.env"
 source "$SCRIPT_DIR/lib/linear.sh"
+source "$SCRIPT_DIR/lib/runner.sh"
 
 PID_FILE="$STATE_DIR/machine.pid"
 LOG_FILE="$STATE_DIR/machine.log"
@@ -185,10 +186,8 @@ handle_finished_agents() {
     [ -d "$state_dir" ] || continue
     local id
     id=$(basename "$state_dir")
-    local session="linear-${id}"
-
     # Skip if agent is still running
-    tmux has-session -t "$session" 2>/dev/null && continue
+    runner_is_running "$id" && continue
 
     # Skip if not a tracked issue
     [ -f "$state_dir/issue_uuid" ] || continue
@@ -261,8 +260,6 @@ poll_and_dispatch() {
     id=$(echo "$issue" | jq -r '.identifier' | tr '[:upper:]' '[:lower:]')
     title=$(echo "$issue" | jq -r '.title')
     state_name=$(echo "$issue" | jq -r '.state.name')
-    local session="linear-${id}"
-
     # Dedup: skip if already seen this UUID in this cycle
     case "$seen" in
       *"$issue_uuid"*) continue ;;
@@ -270,7 +267,7 @@ poll_and_dispatch() {
     seen="$seen $issue_uuid"
 
     # Skip if agent already running
-    tmux has-session -t "$session" 2>/dev/null && continue
+    runner_is_running "$id" && continue
 
     local state_dir="$STATE_DIR/$id"
     mkdir -p "$state_dir"
@@ -310,24 +307,14 @@ dispatch_new() {
   write_agent_env "$issue" "$state_dir"
   build_prompt "$issue" "$state_dir" "new"
 
-  # Save issue metadata
+  # Save issue metadata + workdir (runner reads workdir from state dir)
   echo "$issue_uuid" > "$state_dir/issue_uuid"
   echo "$title" > "$state_dir/title"
   echo "$team_id" > "$state_dir/team_id"
+  echo "$workdir" > "$state_dir/workdir"
   [ -n "$project_id" ] && echo "$project_id" > "$state_dir/project_id"
 
-  # Dispatch agent in tmux
-  local session="linear-${id}"
-  local adapter_cmd="'$SCRIPT_DIR/adapters/${AGENT_TYPE}.sh' start '$state_dir' '$workdir'"
-
-  # Build tmux command with optional env sourcing and setup
-  local tmux_cmd="$adapter_cmd"
-  if [ -n "$env_dir" ]; then
-    [ -f "$env_dir/env.sh" ] && tmux_cmd="source '$env_dir/env.sh' && $tmux_cmd"
-    [ -x "$env_dir/setup.sh" ] && tmux_cmd="'$env_dir/setup.sh' && $tmux_cmd"
-  fi
-
-  tmux new-session -d -s "$session" "$tmux_cmd"
+  runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "start"
 
   log "Dispatched $AGENT_TYPE for $id: $title (env: ${env_dir:-legacy})"
 }
@@ -388,14 +375,7 @@ check_and_resume() {
   # Clear previous agent state for fresh resume
   rm -f "$state_dir/exit_code" "$state_dir/agent_state"
 
-  # Resume agent in tmux (no setup.sh on resume, only env.sh)
-  local session="linear-${id}"
-  local adapter_cmd="'$SCRIPT_DIR/adapters/${AGENT_TYPE}.sh' resume '$state_dir'"
-
-  local tmux_cmd="$adapter_cmd"
-  [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && tmux_cmd="source '$env_dir/env.sh' && $tmux_cmd"
-
-  tmux new-session -d -s "$session" "$tmux_cmd"
+  runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "resume"
 
   log "Resumed $AGENT_TYPE for $id (new comment from $comment_author)"
 }
@@ -431,10 +411,8 @@ cmd_stop() {
     echo "Not running"
   fi
 
-  tmux ls 2>/dev/null | grep "^linear-" | cut -d: -f1 | while read -r s; do
-    tmux kill-session -t "$s" 2>/dev/null
-  done
-  echo "Cleaned up tmux sessions"
+  runner_stop_all
+  echo "Cleaned up agent sessions"
 }
 
 cmd_status() {
@@ -456,9 +434,9 @@ cmd_status() {
   done
 
   echo ""
-  echo "=== Active Agents ==="
+  echo "=== Active Agents ($RUNNER_TYPE) ==="
   local agents
-  agents=$(tmux ls 2>/dev/null | grep "^linear-" || true)
+  agents=$(runner_list)
   if [ -n "$agents" ]; then
     echo "$agents" | while read -r line; do echo "  $line"; done
   else

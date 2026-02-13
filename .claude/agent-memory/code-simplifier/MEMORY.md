@@ -33,18 +33,37 @@
   cat file | while read line; do count=$((count+1)); done
   echo $count  # Always 0
   ```
-- FIX: Use process substitution or eliminate the counter if unused
+- FIX: Use process substitution (`while read ... done < <(cmd)`) when vars need to escape
 
-### Unnecessary Pipes
-- Found: `curl | python3 -c "json.dump(json.load())"` to pretty-print JSON
-- The output goes to `jq` anyway, which doesn't care about formatting
-- DELETED: Python formatting step (saves a process spawn per API call)
+### Unnecessary String Building
+- Building shell commands as concatenated strings is fragile and hard to read
+- tmux/ssh already handle quoting — don't double-wrap with `bash -c` unless needed
+- Prefer direct execution or simple `&&` chains over string interpolation
+- Example: `cmd="a && b && c"; tmux new-session -d "$cmd"` not `"bash -c '$cmd'"`
+
+### Extract Repeated Options
+- Repeated tool invocations with same flags → helper function
+- Found: `scp -o ConnectTimeout=X` used 10+ times → extracted to `_exe_scp()`
+- Same for `ssh` → `_exe_ssh()` already existed
+
+### Inline Single-Use Variables
+- `repo_basename=$(basename "$local_workdir"); remote="$dir/$repo_basename"`
+- SIMPLIFIED: `remote="$dir/$(basename "$local_workdir")"`
+- Only extract when reused or complex
+
+### Command Chains: Unnecessary Checks
+- Checking if env file exists before conditionally sourcing it is redundant if the copy is also conditional
+- WRONG: `[ -f env.sh ] && cmd="$cmd && source env.sh"` after `[ -f env.sh ] && scp env.sh`
+- Either both succeed or both fail — no need to re-check
 
 ## Architecture Notes
 - `/Users/davide/Repos/linear-machine/machine.sh`: main poll loop
 - `/Users/davide/Repos/linear-machine/lib/linear.sh`: GraphQL wrapper
+- `/Users/davide/Repos/linear-machine/lib/runner.sh`: runner loader + contract validation
+- `/Users/davide/Repos/linear-machine/runners/{local,exe}.sh`: execution backends (tmux vs exe.dev VM)
 - `/Users/davide/Repos/linear-machine/adapters/{codex,claude}.sh`: agent adapters
 - Per-project environments: `/Users/davide/Repos/linear-machine/environments/*/`
+- Runner contract: `runner_start`, `runner_is_running`, `runner_stop`, `runner_stop_all`, `runner_list`
 
 ## Future Refactoring Candidates
 - `dispatch_new()` and `check_and_resume()` share 80% logic → consider extract-common pattern

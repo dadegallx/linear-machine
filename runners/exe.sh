@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# exe.dev runner — agents run on managed VMs via exe.dev.
+# Each issue gets its own VM. VMs persist between start/resume (same repo + session).
+# Destroyed on runner_stop, runner_stop_all, or machine.sh stop.
+
+EXE_REPOS_DIR="${EXE_REPOS_DIR:-~/repos}"
+EXE_SSH_TIMEOUT="${EXE_SSH_TIMEOUT:-10}"
+
+_exe_ssh() {
+  ssh -o ConnectTimeout="$EXE_SSH_TIMEOUT" -o StrictHostKeyChecking=accept-new "$@"
+}
+
+_exe_scp() {
+  scp -o ConnectTimeout="$EXE_SSH_TIMEOUT" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Background watcher: polls remote tmux, syncs results when done
+# ---------------------------------------------------------------------------
+_exe_spawn_watcher() {
+  local id="$1" state_dir="$2" ssh_dest="$3"
+  (
+    while sleep 15; do
+      if ! _exe_ssh "$ssh_dest" tmux has-session -t "linear-$id" 2>/dev/null; then
+        # Agent finished — sync results back
+        for f in output session raw.json raw.jsonl all_messages agent.err exit_code; do
+          _exe_scp "$ssh_dest:~/state/$id/$f" "$state_dir/$f" 2>/dev/null || true
+        done
+        break
+      fi
+    done
+  ) &
+}
+
+# ---------------------------------------------------------------------------
+# runner_start ID STATE_DIR ENV_DIR AGENT_TYPE ACTION
+# ---------------------------------------------------------------------------
+runner_start() {
+  local id="$1" state_dir="$2" env_dir="$3" agent_type="$4" action="$5"
+  local remote_workdir="$EXE_REPOS_DIR/$(basename "$(cat "$state_dir/workdir")")"
+
+  if [ "$action" = "start" ]; then
+    # Spin up a new VM
+    local vm_json vm_name ssh_dest
+    vm_json=$(_exe_ssh exe.dev new --json)
+    vm_name=$(echo "$vm_json" | jq -r '.vm_name')
+    ssh_dest=$(echo "$vm_json" | jq -r '.ssh_dest')
+
+    # Save VM identity
+    echo "$vm_name" > "$state_dir/vm_name"
+    echo "$ssh_dest" > "$state_dir/ssh_dest"
+
+    # Create remote workdir and clone repo if configured
+    _exe_ssh "$ssh_dest" "mkdir -p $remote_workdir"
+    if [ -n "$env_dir" ] && [ -f "$env_dir/repo_url" ]; then
+      local repo_url
+      repo_url=$(tr -d '[:space:]' < "$env_dir/repo_url")
+      [ -n "$repo_url" ] && _exe_ssh "$ssh_dest" "git clone $repo_url $remote_workdir" 2>/dev/null
+    fi
+
+    # Create remote structure
+    _exe_ssh "$ssh_dest" "mkdir -p ~/state/$id/env ~/adapters ~/bin"
+
+    # Sync tooling
+    _exe_scp "$SCRIPT_DIR/adapters/${agent_type}.sh" "$ssh_dest:~/adapters/"
+    _exe_scp "$SCRIPT_DIR/bin/linear-tool" "$ssh_dest:~/bin/"
+
+    # Sync state files + write remote workdir
+    echo "$remote_workdir" > "$state_dir/remote_workdir"
+    for f in prompt issue_uuid title team_id env.sh; do
+      [ -f "$state_dir/$f" ] && _exe_scp "$state_dir/$f" "$ssh_dest:~/state/$id/" 2>/dev/null || true
+    done
+    _exe_ssh "$ssh_dest" "echo $remote_workdir > ~/state/$id/workdir"
+
+    # Sync env dir files
+    if [ -n "$env_dir" ]; then
+      [ -f "$env_dir/env.sh" ] && _exe_scp "$env_dir/env.sh" "$ssh_dest:~/state/$id/env/"
+      [ -x "$env_dir/setup.sh" ] && _exe_scp "$env_dir/setup.sh" "$ssh_dest:~/state/$id/env/"
+    fi
+
+    # Build remote command chain
+    local cmd="export PATH=~/bin:\$PATH && source ~/state/$id/env.sh"
+    [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && cmd="$cmd && source ~/state/$id/env/env.sh"
+    [ -n "$env_dir" ] && [ -x "$env_dir/setup.sh" ] && cmd="$cmd && ~/state/$id/env/setup.sh"
+    cmd="$cmd && ~/adapters/${agent_type}.sh start ~/state/$id $remote_workdir"
+
+    _exe_ssh "$ssh_dest" "tmux new-session -d -s linear-$id $cmd"
+    _exe_spawn_watcher "$id" "$state_dir" "$ssh_dest"
+
+  else
+    # Resume — reuse existing VM
+    local ssh_dest
+    ssh_dest=$(cat "$state_dir/ssh_dest") || {
+      echo "No ssh_dest for $id — cannot resume" >&2
+      return 1
+    }
+
+    # Sync updated state
+    _exe_scp "$state_dir/prompt" "$ssh_dest:~/state/$id/"
+    [ -f "$state_dir/env.sh" ] && _exe_scp "$state_dir/env.sh" "$ssh_dest:~/state/$id/" 2>/dev/null || true
+
+    # Clear previous exit markers
+    _exe_ssh "$ssh_dest" "rm -f ~/state/$id/exit_code ~/state/$id/agent_state"
+
+    # Build remote command (no setup.sh on resume)
+    local cmd="export PATH=~/bin:\$PATH && source ~/state/$id/env.sh"
+    [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && cmd="$cmd && source ~/state/$id/env/env.sh"
+    cmd="$cmd && ~/adapters/${agent_type}.sh resume ~/state/$id"
+
+    _exe_ssh "$ssh_dest" "tmux new-session -d -s linear-$id $cmd"
+    _exe_spawn_watcher "$id" "$state_dir" "$ssh_dest"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# runner_is_running ID
+# ---------------------------------------------------------------------------
+runner_is_running() {
+  local ssh_dest
+  ssh_dest=$(cat "$STATE_DIR/$1/ssh_dest" 2>/dev/null) || return 1
+  _exe_ssh "$ssh_dest" tmux has-session -t "linear-$1" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# runner_stop ID
+# ---------------------------------------------------------------------------
+runner_stop() {
+  local vm_name ssh_dest
+  vm_name=$(cat "$STATE_DIR/$1/vm_name" 2>/dev/null) || return 0
+  ssh_dest=$(cat "$STATE_DIR/$1/ssh_dest" 2>/dev/null) || true
+
+  [ -n "$ssh_dest" ] && _exe_ssh "$ssh_dest" tmux kill-session -t "linear-$1" 2>/dev/null || true
+  [ -n "$vm_name" ] && _exe_ssh exe.dev rm "$vm_name" 2>/dev/null || true
+  rm -f "$STATE_DIR/$1/vm_name" "$STATE_DIR/$1/ssh_dest"
+}
+
+# ---------------------------------------------------------------------------
+# runner_stop_all
+# ---------------------------------------------------------------------------
+runner_stop_all() {
+  local vms
+  vms=$(_exe_ssh exe.dev ls --json 2>/dev/null) || return 0
+  while read -r vm; do
+    [ -n "$vm" ] && _exe_ssh exe.dev rm "$vm" 2>/dev/null || true
+  done < <(echo "$vms" | jq -r '.vms[].vm_name // empty')
+}
+
+# ---------------------------------------------------------------------------
+# runner_list
+# ---------------------------------------------------------------------------
+runner_list() {
+  local vms
+  vms=$(_exe_ssh exe.dev ls --json 2>/dev/null) || return 0
+  echo "$vms" | jq -r '.vms[] | .vm_name + " (" + .status + ")"'
+}
