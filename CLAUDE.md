@@ -88,6 +88,6 @@ The system has six layers connected by filesystem state:
 
 `curl`, `jq`, `tmux`, `python3`, and the chosen agent CLI (`codex` or `claude`).
 
-## Maintaining This File
+## Maintaining Docs
 
-Keep this CLAUDE.md up to date. Whenever you add new scripts, change the architecture, modify the adapter contract, add new Linear API functions, or alter the state directory layout, update the relevant sections above in the same commit.
+Keep **both** CLAUDE.md and README.md up to date. Whenever you add new scripts, change the architecture, modify the adapter contract, add new Linear API functions, alter the state directory layout, or add/change runners — update the relevant sections in both files in the same commit. Never let README go stale.
