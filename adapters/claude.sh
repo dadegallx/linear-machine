@@ -9,13 +9,12 @@ state_dir="${2:?Missing STATE_DIR}"
 case "$cmd" in
   start)
     workdir="${3:?Missing WORKDIR}"
-    prompt=$(cat "$state_dir/prompt")
 
     CLAUDECODE= claude -p --output-format json \
       --dangerously-skip-permissions \
       --add-dir "$workdir" \
-      "$prompt" \
-      > "$state_dir/raw.json" 2>/dev/null || true
+      < "$state_dir/prompt" \
+      > "$state_dir/raw.json" 2>"$state_dir/agent.err" || true
 
     jq -r '.session_id // empty' "$state_dir/raw.json" > "$state_dir/session"
     jq -r '.result // empty' "$state_dir/raw.json" > "$state_dir/output"
@@ -25,14 +24,13 @@ case "$cmd" in
     ;;
 
   resume)
-    prompt=$(cat "$state_dir/prompt")
     session_id=$(cat "$state_dir/session")
 
     CLAUDECODE= claude --resume "$session_id" -p \
       --output-format json \
       --dangerously-skip-permissions \
-      "$prompt" \
-      > "$state_dir/raw.json" 2>/dev/null || true
+      < "$state_dir/prompt" \
+      > "$state_dir/raw.json" 2>"$state_dir/agent.err" || true
 
     jq -r '.result // empty' "$state_dir/raw.json" > "$state_dir/output"
     ;;

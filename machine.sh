@@ -39,6 +39,9 @@ collect_results() {
     # Skip if agent is still running
     tmux has-session -t "$session" 2>/dev/null && continue
 
+    # Skip if not a tracked issue (no metadata)
+    [ -f "$state_dir/issue_uuid" ] || continue
+
     # Skip if no pending output
     [ -f "$state_dir/output" ] || continue
 

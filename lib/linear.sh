@@ -2,11 +2,11 @@
 # Linear API functions — pure curl + jq, no dependencies
 
 linear_gql() {
-  local query="$1"
+  local payload="$1"
   curl -s -X POST https://api.linear.app/graphql \
     -H "Authorization: $LINEAR_API_KEY" \
     -H "Content-Type: application/json" \
-    -d "$query" \
+    -d "$payload" \
     | python3 -c "import sys,json; json.dump(json.load(sys.stdin),sys.stdout,ensure_ascii=False)"
 }
 
@@ -14,25 +14,32 @@ linear_poll_issues() {
   # Fetch issues assigned to agent in Todo or In Review states
   # Todo = new work to dispatch
   # In Review = check for new human comments to resume
-  linear_gql "{
-    \"query\": \"{ issues(filter: { assignee: { id: { eq: \\\"$AGENT_USER_ID\\\" } }, state: { id: { in: [\\\"$STATUS_TODO\\\", \\\"$STATUS_IN_REVIEW\\\"] } } }) { nodes { id identifier title description state { id name } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }\"
-  }"
+  local payload
+  payload=$(python3 -c "
+import json, sys
+q = 'query(\$uid: ID!, \$states: [ID!]!) { issues(filter: { assignee: { id: { eq: \$uid } }, state: { id: { in: \$states } } }) { nodes { id identifier title description state { id name } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
+print(json.dumps({'query': q, 'variables': {'uid': sys.argv[1], 'states': [sys.argv[2], sys.argv[3]]}}))" "$AGENT_USER_ID" "$STATUS_TODO" "$STATUS_IN_REVIEW")
+  linear_gql "$payload"
 }
 
 linear_post_comment() {
   local issue_id="$1"
   local body="$2"
-  local escaped_body
-  escaped_body=$(printf '%s' "$body" | jq -Rs .)
-  linear_gql "{
-    \"query\": \"mutation { commentCreate(input: { issueId: \\\"$issue_id\\\", body: $escaped_body }) { success comment { id } } }\"
-  }"
+  local payload
+  payload=$(python3 -c "
+import json, sys
+q = 'mutation(\$input: CommentCreateInput!) { commentCreate(input: \$input) { success comment { id } } }'
+print(json.dumps({'query': q, 'variables': {'input': {'issueId': sys.argv[1], 'body': sys.argv[2]}}}))" "$issue_id" "$body")
+  linear_gql "$payload"
 }
 
 linear_set_status() {
   local issue_id="$1"
   local status_id="$2"
-  linear_gql "{
-    \"query\": \"mutation { issueUpdate(id: \\\"$issue_id\\\", input: { stateId: \\\"$status_id\\\" }) { success } }\"
-  }"
+  local payload
+  payload=$(python3 -c "
+import json, sys
+q = 'mutation(\$id: String!, \$input: IssueUpdateInput!) { issueUpdate(id: \$id, input: \$input) { success } }'
+print(json.dumps({'query': q, 'variables': {'id': sys.argv[1], 'input': {'stateId': sys.argv[2]}}}))" "$issue_id" "$status_id")
+  linear_gql "$payload"
 }
