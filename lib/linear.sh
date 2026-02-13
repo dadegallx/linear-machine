@@ -6,19 +6,17 @@ linear_gql() {
   curl -s -X POST https://api.linear.app/graphql \
     -H "Authorization: $LINEAR_API_KEY" \
     -H "Content-Type: application/json" \
-    -d "$payload" \
-    | python3 -c "import sys,json; json.dump(json.load(sys.stdin),sys.stdout,ensure_ascii=False)"
+    -d "$payload"
 }
 
 linear_poll_issues() {
-  # Fetch issues assigned to agent in Todo or In Review states
-  # Todo = new work to dispatch
-  # In Review = check for new human comments to resume
+  # Fetch issues assigned to agent in the given workflow states
+  # $@ = state IDs to filter on (Todo + In Review from all environments)
   local payload
   payload=$(python3 -c "
 import json, sys
-q = 'query(\$uid: ID!, \$states: [ID!]!) { issues(filter: { assignee: { id: { eq: \$uid } }, state: { id: { in: \$states } } }) { nodes { id identifier title description state { id name } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
-print(json.dumps({'query': q, 'variables': {'uid': sys.argv[1], 'states': [sys.argv[2], sys.argv[3]]}}))" "$AGENT_USER_ID" "$STATUS_TODO" "$STATUS_IN_REVIEW")
+q = 'query(\$uid: ID!, \$states: [ID!]!) { issues(filter: { assignee: { id: { eq: \$uid } }, state: { id: { in: \$states } } }) { nodes { id identifier title description state { id name } project { id name } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
+print(json.dumps({'query': q, 'variables': {'uid': sys.argv[1], 'states': list(sys.argv[2:])}}))" "$AGENT_USER_ID" "$@")
   linear_gql "$payload"
 }
 

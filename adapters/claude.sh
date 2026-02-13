@@ -9,10 +9,10 @@ state_dir="${2:?Missing STATE_DIR}"
 case "$cmd" in
   start)
     workdir="${3:?Missing WORKDIR}"
+    cd "$workdir"
 
     CLAUDECODE= claude -p --output-format json \
       --dangerously-skip-permissions \
-      --add-dir "$workdir" \
       < "$state_dir/prompt" \
       > "$state_dir/raw.json" 2>"$state_dir/agent.err" || true
 

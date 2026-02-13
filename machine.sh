@@ -4,7 +4,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/.env"
-source "$SCRIPT_DIR/config.sh"
+source "$SCRIPT_DIR/config.sh"       # legacy fallback for STATUS_* globals
 source "$SCRIPT_DIR/lib/linear.sh"
 
 PID_FILE="$STATE_DIR/machine.pid"
@@ -13,11 +13,70 @@ LOG_FILE="$STATE_DIR/machine.log"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
 
 # ---------------------------------------------------------------------------
+# Environment helpers
+# ---------------------------------------------------------------------------
+
+# Read value from config file: grep + cut pattern
+read_config_var() {
+  local file="$1" key="$2"
+  grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2 || true
+}
+
+# Collect all TODO + IN_REVIEW status IDs from every environment config.
+# Falls back to global config.sh values if no environments/ dir exists.
+collect_poll_states() {
+  local states=()
+  local found=false
+
+  for env_dir in "$SCRIPT_DIR"/environments/*/; do
+    [ -f "$env_dir/config.sh" ] || continue
+    found=true
+    local todo review
+    todo=$(read_config_var "$env_dir/config.sh" STATUS_TODO)
+    review=$(read_config_var "$env_dir/config.sh" STATUS_IN_REVIEW)
+    [ -n "$todo" ] && states+=("$todo")
+    [ -n "$review" ] && states+=("$review")
+  done
+
+  # Legacy fallback: no environments dir, use globals from config.sh
+  if ! $found; then
+    states+=("$STATUS_TODO" "$STATUS_IN_REVIEW")
+  fi
+
+  printf '%s\n' "${states[@]}" | sort -u
+}
+
+# Resolve project ID → environment directory path.
+# Returns empty string if nothing resolves (caller uses legacy fallback).
+resolve_environment() {
+  local project_id="$1"
+  local mapping="$SCRIPT_DIR/environments/mapping.conf"
+
+  [ -z "$project_id" ] || [ ! -f "$mapping" ] && { echo ""; return; }
+
+  local env_name
+  env_name=$(read_config_var "$mapping" "$project_id")
+  local env_dir="$SCRIPT_DIR/environments/${env_name:-default}"
+  [ -d "$env_dir" ] && echo "$env_dir" || echo ""
+}
+
+# Read repo path from an environment directory.
+# Falls back to the global REPOS_DIR.
+env_repo_path() {
+  local env_dir="$1"
+  [ -n "$env_dir" ] && [ -f "$env_dir/repo_path" ] && {
+    head -1 "$env_dir/repo_path" | tr -d '[:space:]'
+    return
+  }
+  echo "$REPOS_DIR"
+}
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 main_loop() {
   log "Polling every ${POLL_INTERVAL}s for issues assigned to agent ($AGENT_USER_ID)"
-  log "Agent type: $AGENT_TYPE | Repos: $REPOS_DIR"
+  log "Agent type: $AGENT_TYPE"
 
   while true; do
     collect_results
@@ -58,9 +117,18 @@ collect_results() {
     local issue_uuid
     issue_uuid=$(cat "$state_dir/issue_uuid")
 
+    # Resolve environment for per-env status ID
+    local project_id=""
+    [ -f "$state_dir/project_id" ] && project_id=$(cat "$state_dir/project_id")
+    local env_dir
+    env_dir=$(resolve_environment "$project_id")
+    local status_in_review="$STATUS_IN_REVIEW"
+    [ -n "$env_dir" ] && [ -f "$env_dir/config.sh" ] && \
+      status_in_review=$(read_config_var "$env_dir/config.sh" STATUS_IN_REVIEW)
+
     log "Posting results for $id"
     linear_post_comment "$issue_uuid" "$output" > /dev/null
-    linear_set_status "$issue_uuid" "$STATUS_IN_REVIEW" > /dev/null
+    linear_set_status "$issue_uuid" "$status_in_review" > /dev/null
 
     # Mark as processed
     mv "$state_dir/output" "$state_dir/last_output"
@@ -75,7 +143,11 @@ collect_results() {
 # ---------------------------------------------------------------------------
 poll_and_dispatch() {
   local poll_file="$STATE_DIR/poll.json"
-  linear_poll_issues > "$poll_file" 2>/dev/null || return
+  local poll_states=()
+  while IFS= read -r s; do
+    poll_states+=("$s")
+  done < <(collect_poll_states)
+  linear_poll_issues "${poll_states[@]}" > "$poll_file" 2>/dev/null || return
 
   jq -c '.data.issues.nodes // [] | .[]' "$poll_file" 2>/dev/null | while IFS= read -r issue; do
     local issue_uuid id title issue_status
@@ -104,10 +176,20 @@ poll_and_dispatch() {
 # ---------------------------------------------------------------------------
 dispatch_new() {
   local issue="$1" id="$2" state_dir="$3"
-  local issue_uuid title description
+  local issue_uuid title description project_id
   issue_uuid=$(echo "$issue" | jq -r '.id')
   title=$(echo "$issue" | jq -r '.title')
   description=$(echo "$issue" | jq -r '.description // "No description provided."')
+  project_id=$(echo "$issue" | jq -r '.project.id // empty')
+
+  # Resolve environment
+  local env_dir
+  env_dir=$(resolve_environment "$project_id")
+  local workdir
+  workdir=$(env_repo_path "$env_dir")
+  local status_in_progress="$STATUS_IN_PROGRESS"
+  [ -n "$env_dir" ] && [ -f "$env_dir/config.sh" ] && \
+    status_in_progress=$(read_config_var "$env_dir/config.sh" STATUS_IN_PROGRESS)
 
   # Write prompt
   cat > "$state_dir/prompt" <<PROMPT
@@ -126,16 +208,25 @@ PROMPT
   # Save issue metadata
   echo "$issue_uuid" > "$state_dir/issue_uuid"
   echo "$title" > "$state_dir/title"
+  [ -n "$project_id" ] && echo "$project_id" > "$state_dir/project_id"
 
   # Update Linear status
-  linear_set_status "$issue_uuid" "$STATUS_IN_PROGRESS" > /dev/null
+  linear_set_status "$issue_uuid" "$status_in_progress" > /dev/null
 
   # Dispatch agent in tmux
   local session="linear-${id}"
-  tmux new-session -d -s "$session" \
-    "$SCRIPT_DIR/adapters/${AGENT_TYPE}.sh start $state_dir $REPOS_DIR"
+  local adapter_cmd="'$SCRIPT_DIR/adapters/${AGENT_TYPE}.sh' start '$state_dir' '$workdir'"
 
-  log "Dispatched $AGENT_TYPE for $id: $title"
+  # Build tmux command with optional env sourcing and setup
+  local tmux_cmd="$adapter_cmd"
+  if [ -n "$env_dir" ]; then
+    [ -f "$env_dir/env.sh" ] && tmux_cmd="source '$env_dir/env.sh' && $tmux_cmd"
+    [ -x "$env_dir/setup.sh" ] && tmux_cmd="'$env_dir/setup.sh' && $tmux_cmd"
+  fi
+
+  tmux new-session -d -s "$session" "$tmux_cmd"
+
+  log "Dispatched $AGENT_TYPE for $id: $title (env: ${env_dir:-legacy})"
 }
 
 # ---------------------------------------------------------------------------
@@ -147,10 +238,10 @@ check_and_resume() {
   issue_uuid=$(echo "$issue" | jq -r '.id')
 
   # Need a saved session to resume
-  [ -f "$state_dir/session" ] || return
+  [ -f "$state_dir/session" ] || return 0
   local session_id
   session_id=$(cat "$state_dir/session")
-  [ -n "$session_id" ] || return
+  [ -n "$session_id" ] || return 0
 
   # Find latest comment NOT from the agent
   local latest_human_comment
@@ -158,22 +249,31 @@ check_and_resume() {
     [.comments.nodes[] | select(.user.id != \"$AGENT_USER_ID\")]
     | sort_by(.createdAt) | last // empty
   ")
-  [ -z "$latest_human_comment" ] || [ "$latest_human_comment" = "null" ] && return
+  [ -z "$latest_human_comment" ] || [ "$latest_human_comment" = "null" ] && return 0
 
   local comment_ts
   comment_ts=$(echo "$latest_human_comment" | jq -r '.createdAt // empty')
-  [ -n "$comment_ts" ] || return
+  [ -n "$comment_ts" ] || return 0
 
   # Skip if we already processed this comment
   local saved_ts=""
   [ -f "$state_dir/posted_at" ] && saved_ts=$(cat "$state_dir/posted_at")
   if [ -n "$saved_ts" ] && [[ ! "$comment_ts" > "$saved_ts" ]]; then
-    return
+    return 0
   fi
 
   local comment_body comment_author
   comment_body=$(echo "$latest_human_comment" | jq -r '.body')
   comment_author=$(echo "$latest_human_comment" | jq -r '.user.displayName')
+
+  # Resolve environment from saved project_id
+  local project_id=""
+  [ -f "$state_dir/project_id" ] && project_id=$(cat "$state_dir/project_id")
+  local env_dir
+  env_dir=$(resolve_environment "$project_id")
+  local status_in_progress="$STATUS_IN_PROGRESS"
+  [ -n "$env_dir" ] && [ -f "$env_dir/config.sh" ] && \
+    status_in_progress=$(read_config_var "$env_dir/config.sh" STATUS_IN_PROGRESS)
 
   # Write resume prompt
   cat > "$state_dir/prompt" <<PROMPT
@@ -191,12 +291,17 @@ PROMPT
   echo "$issue_uuid" > "$state_dir/issue_uuid"
 
   # Update Linear status
-  linear_set_status "$issue_uuid" "$STATUS_IN_PROGRESS" > /dev/null
+  linear_set_status "$issue_uuid" "$status_in_progress" > /dev/null
 
-  # Resume agent in tmux
+  # Resume agent in tmux (no setup.sh on resume, only env.sh)
   local session="linear-${id}"
-  tmux new-session -d -s "$session" \
-    "$SCRIPT_DIR/adapters/${AGENT_TYPE}.sh resume $state_dir"
+  local adapter_cmd="'$SCRIPT_DIR/adapters/${AGENT_TYPE}.sh' resume '$state_dir'"
+
+  # Build tmux command with optional env sourcing (no setup on resume)
+  local tmux_cmd="$adapter_cmd"
+  [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && tmux_cmd="source '$env_dir/env.sh' && $tmux_cmd"
+
+  tmux new-session -d -s "$session" "$tmux_cmd"
 
   log "Resumed $AGENT_TYPE for $id (new comment from $comment_author)"
 }
@@ -234,10 +339,8 @@ cmd_stop() {
   fi
 
   # Kill all agent tmux sessions
-  local count=0
   tmux ls 2>/dev/null | grep "^linear-" | cut -d: -f1 | while read -r s; do
     tmux kill-session -t "$s" 2>/dev/null
-    count=$((count + 1))
   done
   echo "Cleaned up tmux sessions"
 }
@@ -249,6 +352,16 @@ cmd_status() {
   else
     echo "Loop: stopped"
   fi
+
+  echo ""
+  echo "=== Environments ==="
+  for env_dir in "$SCRIPT_DIR"/environments/*/; do
+    [ -f "$env_dir/config.sh" ] || continue
+    local name repo
+    name=$(basename "$env_dir")
+    repo=$(head -1 "$env_dir/repo_path" 2>/dev/null | tr -d '[:space:]' || echo "(no repo_path)")
+    echo "  $name → $repo"
+  done
 
   echo ""
   echo "=== Active Agents ==="
@@ -268,8 +381,15 @@ cmd_status() {
     local title=""
     [ -f "$state_dir/title" ] && title=$(cat "$state_dir/title")
     local has_session=""
-    [ -f "$state_dir/session" ] && has_session="(has session)"
-    echo "  $id: $title $has_session"
+    [ -f "$state_dir/session" ] && has_session="(session)"
+    local env_info=""
+    if [ -f "$state_dir/project_id" ]; then
+      local pid env_dir
+      pid=$(cat "$state_dir/project_id")
+      env_dir=$(resolve_environment "$pid")
+      [ -n "$env_dir" ] && env_info="[$(basename "$env_dir")]"
+    fi
+    echo "  $id: $title $env_info $has_session"
   done
 }
 
