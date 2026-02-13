@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# linear-tool — agent-callable CLI for Linear operations
+# Env required: LINEAR_API_KEY, LINEAR_ISSUE_ID, LINEAR_TEAM_ID, AGENT_USER_ID, LINEAR_STATE_DIR
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+source "$SCRIPT_DIR/lib/linear.sh"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: linear-tool <command> [args]
+
+Commands:
+  assign                   Assign this issue to yourself
+  status "State Name"      Update issue status (e.g. "In Progress", "In Review", "Blocked")
+  comment "body"           Post a comment on this issue
+  get-comments             Print recent comments
+EOF
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Workflow state resolution (cached per session)
+# ---------------------------------------------------------------------------
+resolve_state_id() {
+  local target_name="$1"
+  local cache="$LINEAR_STATE_DIR/workflow_states.json"
+
+  # Fetch + cache on first call
+  if [ ! -f "$cache" ]; then
+    linear_get_workflow_states "$LINEAR_TEAM_ID" | jq '.data.workflowStates.nodes' > "$cache"
+  fi
+
+  # Case-insensitive exact match
+  local state_id
+  state_id=$(jq -r --arg name "$target_name" \
+    '[.[] | select(.name | ascii_downcase == ($name | ascii_downcase))] | .[0].id // empty' \
+    "$cache")
+
+  if [ -z "$state_id" ]; then
+    echo "ERROR: no workflow state matching '$target_name' for team $LINEAR_TEAM_ID" >&2
+    echo "Available states:" >&2
+    jq -r '.[].name' "$cache" >&2
+    exit 1
+  fi
+
+  echo "$state_id"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_assign() {
+  local result
+  result=$(linear_assign_issue "$LINEAR_ISSUE_ID" "$AGENT_USER_ID")
+  local ok
+  ok=$(echo "$result" | jq -r '.data.issueUpdate.success // false')
+  if [ "$ok" = "true" ]; then
+    echo "Assigned issue to agent."
+  else
+    echo "Failed to assign issue:" >&2
+    echo "$result" | jq . >&2
+    exit 1
+  fi
+}
+
+cmd_status() {
+  local name="${1:?Usage: linear-tool status \"State Name\"}"
+  local state_id
+  state_id=$(resolve_state_id "$name")
+
+  local result
+  result=$(linear_set_status "$LINEAR_ISSUE_ID" "$state_id")
+  local ok
+  ok=$(echo "$result" | jq -r '.data.issueUpdate.success // false')
+  if [ "$ok" = "true" ]; then
+    echo "Status updated to '$name'."
+  else
+    echo "Failed to update status:" >&2
+    echo "$result" | jq . >&2
+    exit 1
+  fi
+
+  # If blocking, signal machine.sh to stop the agent
+  local name_lower
+  name_lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+  case "$name_lower" in
+    *block*)
+      echo "100" > "$LINEAR_STATE_DIR/exit_code"
+      ;;
+  esac
+}
+
+cmd_comment() {
+  local body="${1:?Usage: linear-tool comment \"body\"}"
+  local result
+  result=$(linear_post_comment "$LINEAR_ISSUE_ID" "$body")
+  local ok
+  ok=$(echo "$result" | jq -r '.data.commentCreate.success // false')
+  if [ "$ok" = "true" ]; then
+    echo "Comment posted."
+  else
+    echo "Failed to post comment:" >&2
+    echo "$result" | jq . >&2
+    exit 1
+  fi
+}
+
+cmd_get_comments() {
+  local result
+  result=$(linear_get_comments "$LINEAR_ISSUE_ID")
+  echo "$result" | jq -r '
+    .data.issue.comments.nodes[]
+    | "\(.user.displayName) (\(.createdAt)):\n\(.body)\n---"
+  '
+}
+
+# ---------------------------------------------------------------------------
+# Entry
+# ---------------------------------------------------------------------------
+[ $# -ge 1 ] || usage
+
+case "$1" in
+  assign)       cmd_assign ;;
+  status)       cmd_status "${2:-}" ;;
+  comment)      cmd_comment "${2:-}" ;;
+  get-comments) cmd_get_comments ;;
+  *)            usage ;;
+esac

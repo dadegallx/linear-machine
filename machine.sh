@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# linear-machine — polls Linear, dispatches coding agents, posts results
+# linear-machine — polls Linear, dispatches self-managing agents
+# Machine.sh is a lightweight supervisor: dispatch + crash recovery + resume on human reply.
+# Agents manage their own Linear workflow via bin/linear-tool.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/.env"
-source "$SCRIPT_DIR/config.sh"       # legacy fallback for STATUS_* globals
 source "$SCRIPT_DIR/lib/linear.sh"
 
 PID_FILE="$STATE_DIR/machine.pid"
@@ -16,59 +17,150 @@ log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
 # Environment helpers
 # ---------------------------------------------------------------------------
 
-# Read value from config file: grep + cut pattern
 read_config_var() {
   local file="$1" key="$2"
   grep "^${key}=" "$file" 2>/dev/null | cut -d= -f2 || true
 }
 
-# Collect all TODO + IN_REVIEW status IDs from every environment config.
-# Falls back to global config.sh values if no environments/ dir exists.
-collect_poll_states() {
-  local states=()
-  local found=false
-
-  for env_dir in "$SCRIPT_DIR"/environments/*/; do
-    [ -f "$env_dir/config.sh" ] || continue
-    found=true
-    local todo review
-    todo=$(read_config_var "$env_dir/config.sh" STATUS_TODO)
-    review=$(read_config_var "$env_dir/config.sh" STATUS_IN_REVIEW)
-    [ -n "$todo" ] && states+=("$todo")
-    [ -n "$review" ] && states+=("$review")
-  done
-
-  # Legacy fallback: no environments dir, use globals from config.sh
-  if ! $found; then
-    states+=("$STATUS_TODO" "$STATUS_IN_REVIEW")
-  fi
-
-  printf '%s\n' "${states[@]}" | sort -u
-}
-
-# Resolve project ID → environment directory path.
-# Returns empty string if nothing resolves (caller uses legacy fallback).
 resolve_environment() {
   local project_id="$1"
   local mapping="$SCRIPT_DIR/environments/mapping.conf"
-
-  [ -z "$project_id" ] || [ ! -f "$mapping" ] && { echo ""; return; }
-
+  [ -z "$project_id" ] || [ ! -f "$mapping" ] && { echo ""; return 0; }
   local env_name
   env_name=$(read_config_var "$mapping" "$project_id")
   local env_dir="$SCRIPT_DIR/environments/${env_name:-default}"
   [ -d "$env_dir" ] && echo "$env_dir" || echo ""
 }
 
-# Read repo path from an environment directory.
-# Falls back to the global REPOS_DIR.
 env_repo_path() {
   local env_dir="$1"
   [ -n "$env_dir" ] && [ -f "$env_dir/repo_path" ] && {
     head -1 "$env_dir/repo_path" | tr -d '[:space:]'
-    return
+    return 0
   }
   echo "$REPOS_DIR"
+}
+
+# ---------------------------------------------------------------------------
+# Workflow state resolution (for crash recovery)
+# ---------------------------------------------------------------------------
+resolve_state_id() {
+  local team_id="$1" target_name="$2" state_dir="$3"
+  local cache="$state_dir/workflow_states.json"
+
+  if [ ! -f "$cache" ]; then
+    linear_get_workflow_states "$team_id" | jq '.data.workflowStates.nodes' > "$cache"
+  fi
+
+  jq -r --arg name "$target_name" \
+    '[.[] | select(.name | ascii_downcase == ($name | ascii_downcase))] | .[0].id // empty' \
+    "$cache"
+}
+
+# ---------------------------------------------------------------------------
+# Prompt building
+# ---------------------------------------------------------------------------
+build_tool_docs() {
+  cat <<'TOOLDOCS'
+## Linear Tools
+
+You have the `linear-tool` command to manage this issue:
+
+  linear-tool assign              # assign this issue to yourself
+  linear-tool status "In Progress"  # update issue status
+  linear-tool status "In Review"    # mark ready for review
+  linear-tool status "Blocked"      # signal you need input (stops agent)
+  linear-tool comment "message"     # post a comment
+  linear-tool get-comments          # read recent comments
+
+## Workflow
+
+1. Run `linear-tool assign` then `linear-tool status "In Progress"`
+2. Do the work
+3. Post progress updates with `linear-tool comment "..."`
+4. When done: `linear-tool comment "summary of changes"` then `linear-tool status "In Review"`
+5. If stuck: `linear-tool comment "your question"` then `linear-tool status "Blocked"` — then stop
+
+After setting "Blocked", finish your response immediately. You will be resumed when a human replies.
+TOOLDOCS
+}
+
+build_prompt() {
+  local issue="$1" state_dir="$2" mode="$3"
+
+  if [ "$mode" = "new" ]; then
+    local identifier title description state_name
+    identifier=$(echo "$issue" | jq -r '.identifier')
+    title=$(echo "$issue" | jq -r '.title')
+    description=$(echo "$issue" | jq -r '.description // "No description provided."')
+    state_name=$(echo "$issue" | jq -r '.state.name')
+
+    # Format recent comments
+    local comments=""
+    comments=$(echo "$issue" | jq -r '
+      [.comments.nodes[] | "\(.user.displayName) (\(.createdAt)): \(.body)"]
+      | .[-5:] | .[]
+    ' 2>/dev/null || true)
+
+    cat > "$state_dir/prompt" <<PROMPT
+# Linear Issue: $identifier
+Current Status: $state_name
+
+## Task
+Title: $title
+
+Description:
+$description
+
+## Recent Comments
+${comments:-"(none)"}
+
+---
+
+$(build_tool_docs)
+PROMPT
+
+  elif [ "$mode" = "resume" ]; then
+    local identifier comment_author comment_body
+    identifier=$(echo "$issue" | jq -r '.identifier')
+    comment_author="$4"
+    comment_body="$5"
+
+    cat > "$state_dir/prompt" <<PROMPT
+# Linear Issue: $identifier (resumed)
+
+## Human Reply
+
+$comment_author wrote:
+$comment_body
+
+---
+
+$(build_tool_docs)
+
+Continue working on this issue. The tools above are still available.
+PROMPT
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Agent env file (Linear-specific vars for linear-tool)
+# ---------------------------------------------------------------------------
+write_agent_env() {
+  local issue="$1" state_dir="$2"
+  local issue_uuid team_id identifier
+  issue_uuid=$(echo "$issue" | jq -r '.id')
+  team_id=$(echo "$issue" | jq -r '.team.id')
+  identifier=$(echo "$issue" | jq -r '.identifier')
+
+  cat > "$state_dir/env.sh" <<ENV
+export LINEAR_API_KEY="$LINEAR_API_KEY"
+export LINEAR_ISSUE_ID="$issue_uuid"
+export LINEAR_ISSUE_IDENTIFIER="$identifier"
+export LINEAR_TEAM_ID="$team_id"
+export AGENT_USER_ID="$AGENT_USER_ID"
+export LINEAR_STATE_DIR="$state_dir"
+ENV
 }
 
 # ---------------------------------------------------------------------------
@@ -79,16 +171,16 @@ main_loop() {
   log "Agent type: $AGENT_TYPE"
 
   while true; do
-    collect_results
+    handle_finished_agents
     poll_and_dispatch
     sleep "$POLL_INTERVAL"
   done
 }
 
 # ---------------------------------------------------------------------------
-# Phase 1: collect finished agents — post output, update status
+# Phase 1: handle finished agents — crash recovery only
 # ---------------------------------------------------------------------------
-collect_results() {
+handle_finished_agents() {
   for state_dir in "$STATE_DIR"/*/; do
     [ -d "$state_dir" ] || continue
     local id
@@ -98,43 +190,53 @@ collect_results() {
     # Skip if agent is still running
     tmux has-session -t "$session" 2>/dev/null && continue
 
-    # Skip if not a tracked issue (no metadata)
+    # Skip if not a tracked issue
     [ -f "$state_dir/issue_uuid" ] || continue
 
-    # Skip if no pending output
-    [ -f "$state_dir/output" ] || continue
+    # Skip if already handled (agent_state set)
+    [ -f "$state_dir/agent_state" ] && continue
 
-    local output
-    output=$(cat "$state_dir/output")
+    local exit_code="0"
+    [ -f "$state_dir/exit_code" ] && exit_code=$(cat "$state_dir/exit_code")
 
-    # Skip empty output (agent produced nothing)
-    [ -z "$output" ] && {
-      log "WARN: empty output for $id"
-      mv "$state_dir/output" "$state_dir/last_output"
-      continue
-    }
+    if [ "$exit_code" = "0" ]; then
+      # Success — agent handled everything via linear-tool
+      echo "done" > "$state_dir/agent_state"
+      log "Agent finished for $id (success)"
 
-    local issue_uuid
-    issue_uuid=$(cat "$state_dir/issue_uuid")
+    elif [ "$exit_code" = "100" ]; then
+      # Blocked — agent signaled via linear-tool status "Blocked"
+      echo "blocked" > "$state_dir/agent_state"
+      log "Agent blocked for $id (waiting for human reply)"
 
-    # Resolve environment for per-env status ID
-    local project_id=""
-    [ -f "$state_dir/project_id" ] && project_id=$(cat "$state_dir/project_id")
-    local env_dir
-    env_dir=$(resolve_environment "$project_id")
-    local status_in_review="$STATUS_IN_REVIEW"
-    [ -n "$env_dir" ] && [ -f "$env_dir/config.sh" ] && \
-      status_in_review=$(read_config_var "$env_dir/config.sh" STATUS_IN_REVIEW)
+    else
+      # Crash — unexpected exit, post error comment
+      echo "crashed" > "$state_dir/agent_state"
+      local issue_uuid
+      issue_uuid=$(cat "$state_dir/issue_uuid")
 
-    log "Posting results for $id"
-    linear_post_comment "$issue_uuid" "$output" > /dev/null
-    linear_set_status "$issue_uuid" "$status_in_review" > /dev/null
+      local err_snippet=""
+      [ -f "$state_dir/agent.err" ] && err_snippet=$(tail -20 "$state_dir/agent.err")
 
-    # Mark as processed
-    mv "$state_dir/output" "$state_dir/last_output"
-    date -u +%Y-%m-%dT%H:%M:%SZ > "$state_dir/posted_at"
+      linear_post_comment "$issue_uuid" \
+        "Agent crashed (exit code: $exit_code). Error output:
+\`\`\`
+${err_snippet:-no error output captured}
+\`\`\`" > /dev/null
 
-    log "Posted comment for $id, moved to In Review"
+      # Try to move to Blocked state
+      local team_id=""
+      [ -f "$state_dir/team_id" ] && team_id=$(cat "$state_dir/team_id")
+      if [ -n "$team_id" ]; then
+        local blocked_id
+        blocked_id=$(resolve_state_id "$team_id" "Blocked" "$state_dir")
+        if [ -n "$blocked_id" ]; then
+          linear_set_status "$issue_uuid" "$blocked_id" > /dev/null
+        fi
+      fi
+
+      log "CRASH: agent for $id exited with code $exit_code"
+    fi
   done
 }
 
@@ -143,32 +245,48 @@ collect_results() {
 # ---------------------------------------------------------------------------
 poll_and_dispatch() {
   local poll_file="$STATE_DIR/poll.json"
-  local poll_states=()
-  while IFS= read -r s; do
-    poll_states+=("$s")
-  done < <(collect_poll_states)
-  linear_poll_issues "${poll_states[@]}" > "$poll_file" 2>/dev/null || return
+  linear_poll_issues > "$poll_file" 2>/dev/null || return 0
 
-  jq -c '.data.issues.nodes // [] | .[]' "$poll_file" 2>/dev/null | while IFS= read -r issue; do
-    local issue_uuid id title issue_status
+  # Also poll @mentions if AGENT_DISPLAY_NAME is set
+  local mentions_file="$STATE_DIR/mentions.json"
+  if [ -n "${AGENT_DISPLAY_NAME:-}" ]; then
+    linear_poll_mentions "$AGENT_DISPLAY_NAME" > "$mentions_file" 2>/dev/null || true
+  fi
+
+  # Process assigned issues + mentions, dedup by issue UUID
+  local seen=""
+  while IFS= read -r issue; do
+    local issue_uuid id title state_name
     issue_uuid=$(echo "$issue" | jq -r '.id')
     id=$(echo "$issue" | jq -r '.identifier' | tr '[:upper:]' '[:lower:]')
     title=$(echo "$issue" | jq -r '.title')
-    issue_status=$(echo "$issue" | jq -r '.state.name')
+    state_name=$(echo "$issue" | jq -r '.state.name')
     local session="linear-${id}"
 
-    # Skip if agent already running for this issue
+    # Dedup: skip if already seen this UUID in this cycle
+    case "$seen" in
+      *"$issue_uuid"*) continue ;;
+    esac
+    seen="$seen $issue_uuid"
+
+    # Skip if agent already running
     tmux has-session -t "$session" 2>/dev/null && continue
 
     local state_dir="$STATE_DIR/$id"
     mkdir -p "$state_dir"
 
-    if [ "$issue_status" = "Todo" ]; then
+    if [ "$state_name" = "Todo" ]; then
       dispatch_new "$issue" "$id" "$state_dir"
-    elif [ "$issue_status" = "In Review" ]; then
+    elif [ "$state_name" = "In Review" ] || [ "$state_name" = "Blocked" ]; then
       check_and_resume "$issue" "$id" "$state_dir"
     fi
-  done
+    # Skip: In Progress (agent running or will be), Done, Cancelled, etc.
+  done < <({
+    jq -c '.data.issues.nodes // [] | .[]' "$poll_file" 2>/dev/null || true
+    if [ -n "${AGENT_DISPLAY_NAME:-}" ] && [ -f "$mentions_file" ]; then
+      jq -c '.data.issueSearch.nodes // [] | .[]' "$mentions_file" 2>/dev/null || true
+    fi
+  })
 }
 
 # ---------------------------------------------------------------------------
@@ -176,43 +294,27 @@ poll_and_dispatch() {
 # ---------------------------------------------------------------------------
 dispatch_new() {
   local issue="$1" id="$2" state_dir="$3"
-  local issue_uuid title description project_id
+  local issue_uuid title project_id team_id
   issue_uuid=$(echo "$issue" | jq -r '.id')
   title=$(echo "$issue" | jq -r '.title')
-  description=$(echo "$issue" | jq -r '.description // "No description provided."')
   project_id=$(echo "$issue" | jq -r '.project.id // empty')
+  team_id=$(echo "$issue" | jq -r '.team.id')
 
   # Resolve environment
   local env_dir
   env_dir=$(resolve_environment "$project_id")
   local workdir
   workdir=$(env_repo_path "$env_dir")
-  local status_in_progress="$STATUS_IN_PROGRESS"
-  [ -n "$env_dir" ] && [ -f "$env_dir/config.sh" ] && \
-    status_in_progress=$(read_config_var "$env_dir/config.sh" STATUS_IN_PROGRESS)
 
-  # Write prompt
-  cat > "$state_dir/prompt" <<PROMPT
-You are working on the following task:
-
-Title: $title
-
-Description:
-$description
-
-Work in this repository directory. Complete the task as described.
-If you need clarification or input from the team, clearly state your question.
-When finished, provide a summary of what you did and what changed.
-PROMPT
+  # Build prompt + agent env
+  write_agent_env "$issue" "$state_dir"
+  build_prompt "$issue" "$state_dir" "new"
 
   # Save issue metadata
   echo "$issue_uuid" > "$state_dir/issue_uuid"
   echo "$title" > "$state_dir/title"
+  echo "$team_id" > "$state_dir/team_id"
   [ -n "$project_id" ] && echo "$project_id" > "$state_dir/project_id"
-
-  # Update Linear status
-  linear_set_status "$issue_uuid" "$status_in_progress" > /dev/null
-  linear_post_comment "$issue_uuid" "I'm on it." > /dev/null
 
   # Dispatch agent in tmux
   local session="linear-${id}"
@@ -259,7 +361,7 @@ check_and_resume() {
   # Skip if we already processed this comment
   local saved_ts=""
   [ -f "$state_dir/posted_at" ] && saved_ts=$(cat "$state_dir/posted_at")
-  if [ -n "$saved_ts" ] && [[ ! "$comment_ts" > "$saved_ts" ]]; then
+  if [ -n "$saved_ts" ] && ! [ "$comment_ts" \> "$saved_ts" ]; then
     return 0
   fi
 
@@ -272,34 +374,24 @@ check_and_resume() {
   [ -f "$state_dir/project_id" ] && project_id=$(cat "$state_dir/project_id")
   local env_dir
   env_dir=$(resolve_environment "$project_id")
-  local status_in_progress="$STATUS_IN_PROGRESS"
-  [ -n "$env_dir" ] && [ -f "$env_dir/config.sh" ] && \
-    status_in_progress=$(read_config_var "$env_dir/config.sh" STATUS_IN_PROGRESS)
 
-  # Write resume prompt
-  cat > "$state_dir/prompt" <<PROMPT
-The team has responded to your work on this task:
-
-New comment from $comment_author:
-$comment_body
-
-Continue your work, taking this feedback into account.
-If you need more input, clearly state your question.
-When finished, provide a summary of what you did.
-PROMPT
+  # Refresh agent env + build resume prompt
+  write_agent_env "$issue" "$state_dir"
+  build_prompt "$issue" "$state_dir" "resume" "$comment_author" "$comment_body"
 
   # Save issue UUID (might already exist)
   echo "$issue_uuid" > "$state_dir/issue_uuid"
 
-  # Update Linear status
-  linear_set_status "$issue_uuid" "$status_in_progress" > /dev/null
-  linear_post_comment "$issue_uuid" "I'm resuming now with new feedback." > /dev/null
+  # Record timestamp so we don't re-process this comment
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$state_dir/posted_at"
+
+  # Clear previous agent state for fresh resume
+  rm -f "$state_dir/exit_code" "$state_dir/agent_state"
 
   # Resume agent in tmux (no setup.sh on resume, only env.sh)
   local session="linear-${id}"
   local adapter_cmd="'$SCRIPT_DIR/adapters/${AGENT_TYPE}.sh' resume '$state_dir'"
 
-  # Build tmux command with optional env sourcing (no setup on resume)
   local tmux_cmd="$adapter_cmd"
   [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && tmux_cmd="source '$env_dir/env.sh' && $tmux_cmd"
 
@@ -327,7 +419,6 @@ cmd_start() {
 }
 
 cmd_stop() {
-  # Kill main loop
   if [ -f "$PID_FILE" ]; then
     local pid
     pid=$(cat "$PID_FILE")
@@ -340,7 +431,6 @@ cmd_stop() {
     echo "Not running"
   fi
 
-  # Kill all agent tmux sessions
   tmux ls 2>/dev/null | grep "^linear-" | cut -d: -f1 | while read -r s; do
     tmux kill-session -t "$s" 2>/dev/null
   done
@@ -358,7 +448,7 @@ cmd_status() {
   echo ""
   echo "=== Environments ==="
   for env_dir in "$SCRIPT_DIR"/environments/*/; do
-    [ -f "$env_dir/config.sh" ] || continue
+    [ -d "$env_dir" ] || continue
     local name repo
     name=$(basename "$env_dir")
     repo=$(head -1 "$env_dir/repo_path" 2>/dev/null | tr -d '[:space:]' || echo "(no repo_path)")
@@ -367,12 +457,13 @@ cmd_status() {
 
   echo ""
   echo "=== Active Agents ==="
-  local found=false
-  tmux ls 2>/dev/null | grep "^linear-" | while read -r line; do
-    found=true
-    echo "  $line"
-  done
-  $found || echo "  (none)"
+  local agents
+  agents=$(tmux ls 2>/dev/null | grep "^linear-" || true)
+  if [ -n "$agents" ]; then
+    echo "$agents" | while read -r line; do echo "  $line"; done
+  else
+    echo "  (none)"
+  fi
 
   echo ""
   echo "=== Tracked Issues ==="
@@ -382,8 +473,8 @@ cmd_status() {
     id=$(basename "$state_dir")
     local title=""
     [ -f "$state_dir/title" ] && title=$(cat "$state_dir/title")
-    local has_session=""
-    [ -f "$state_dir/session" ] && has_session="(session)"
+    local agent_state=""
+    [ -f "$state_dir/agent_state" ] && agent_state="[$(cat "$state_dir/agent_state")]"
     local env_info=""
     if [ -f "$state_dir/project_id" ]; then
       local pid env_dir
@@ -391,7 +482,7 @@ cmd_status() {
       env_dir=$(resolve_environment "$pid")
       [ -n "$env_dir" ] && env_info="[$(basename "$env_dir")]"
     fi
-    echo "  $id: $title $env_info $has_session"
+    echo "  $id: $title $env_info $agent_state"
   done
 }
 

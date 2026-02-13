@@ -1,6 +1,3 @@
-# LEGACY — status IDs are now per-environment in environments/*/config.sh
-# These globals serve as fallback when no environments/ directory exists.
-# Find IDs via: Linear Settings → Team → Workflow → click each state
-STATUS_TODO=f8bb0d7b-f94a-48ba-acfb-56c9ad78673e
-STATUS_IN_PROGRESS=a0a0793a-7864-428f-a82b-d6e1e9b27c34
-STATUS_IN_REVIEW=4370174c-d82a-4f53-9ee7-e063a004bdb4
+# Workflow state IDs are now resolved dynamically via the Linear API.
+# This file is kept for backward compatibility but no longer defines STATUS_* vars.
+# See bin/linear-tool and machine.sh resolve_state_id() for the new approach.
