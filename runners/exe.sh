@@ -23,6 +23,7 @@ _exe_spawn_watcher() {
     while sleep 15; do
       if ! _exe_ssh "$ssh_dest" tmux has-session -t "linear-$id" 2>/dev/null; then
         # Agent finished — sync results back
+        log "VM session ended for $id ($ssh_dest), syncing results"
         for f in output session raw.json raw.jsonl all_messages agent.err exit_code; do
           _exe_scp "$ssh_dest:~/state/$id/$f" "$state_dir/$f" 2>/dev/null || true
         done
@@ -45,6 +46,8 @@ runner_start() {
     vm_json=$(_exe_ssh exe.dev new --json)
     vm_name=$(echo "$vm_json" | jq -r '.vm_name')
     ssh_dest=$(echo "$vm_json" | jq -r '.ssh_dest')
+
+    log "VM provisioned for $id: $vm_name ($ssh_dest)"
 
     # Save VM identity
     echo "$vm_name" > "$state_dir/vm_name"
@@ -130,7 +133,10 @@ runner_stop() {
   ssh_dest=$(cat "$STATE_DIR/$1/ssh_dest" 2>/dev/null) || true
 
   [ -n "$ssh_dest" ] && _exe_ssh "$ssh_dest" tmux kill-session -t "linear-$1" 2>/dev/null || true
-  [ -n "$vm_name" ] && _exe_ssh exe.dev rm "$vm_name" 2>/dev/null || true
+  if [ -n "$vm_name" ]; then
+    _exe_ssh exe.dev rm "$vm_name" 2>/dev/null || true
+    log "VM destroyed for $1: $vm_name"
+  fi
   rm -f "$STATE_DIR/$1/vm_name" "$STATE_DIR/$1/ssh_dest"
 }
 
@@ -141,7 +147,10 @@ runner_stop_all() {
   local vms
   vms=$(_exe_ssh exe.dev ls --json 2>/dev/null) || return 0
   while read -r vm; do
-    [ -n "$vm" ] && _exe_ssh exe.dev rm "$vm" 2>/dev/null || true
+    if [ -n "$vm" ]; then
+      _exe_ssh exe.dev rm "$vm" 2>/dev/null || true
+      log "VM destroyed: $vm"
+    fi
   done < <(echo "$vms" | jq -r '.vms[].vm_name // empty')
 }
 
