@@ -212,6 +212,7 @@ PROMPT
 
   # Update Linear status
   linear_set_status "$issue_uuid" "$status_in_progress" > /dev/null
+  linear_post_comment "$issue_uuid" "I'm on it." > /dev/null
 
   # Dispatch agent in tmux
   local session="linear-${id}"
@@ -292,6 +293,7 @@ PROMPT
 
   # Update Linear status
   linear_set_status "$issue_uuid" "$status_in_progress" > /dev/null
+  linear_post_comment "$issue_uuid" "I'm resuming now with new feedback." > /dev/null
 
   # Resume agent in tmux (no setup.sh on resume, only env.sh)
   local session="linear-${id}"
