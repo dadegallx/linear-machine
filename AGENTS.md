@@ -44,8 +44,8 @@ The system has seven layers connected by filesystem state:
    - `runner_start ID STATE_DIR ENV_DIR AGENT_TYPE ACTION` — launch or resume an agent
    - `runner_is_running ID` — exit 0 if agent still active, 1 if done
    - `runner_stop ID` — kill agent (and destroy VM for remote providers)
-   - `runner_stop_all` — kill all `linear-*` agents
-   - `runner_list` — print running agents
+   - `runner_stop_all` — stop only issue-attached VMs tracked in `STATE_DIR`
+   - `runner_list` — print only issue-attached managed VMs
    - **`runners/local.sh`** — Default. Runs agents in local tmux sessions (extracted from machine.sh).
    - **`runners/exe.sh`** — exe.dev managed VMs. Full lifecycle: spin up → clone repo → sync state → run agent → sync results back. VMs persist between start/resume. Reads `repo_url` from env dir for remote cloning.
 
@@ -89,7 +89,7 @@ The system has seven layers connected by filesystem state:
 - **Setup vs resume**: `setup.sh` runs only on first dispatch; `env.sh` is sourced on both start and resume.
 - **Exit code protocol**: 0 = success, 100 = blocked (agent chose to stop), other = crash.
 - **Runner/provider/adapter split**: `machine.sh → runner (where) → provider auth sync (credentials) → adapter (what)`. Add new remote auth behavior by creating `providers/<agent>.sh` with `provider_sync_credentials`; no runner rewrite needed.
-- **Remote VM lifecycle**: exe.dev VMs persist between start/resume (same repo state + agent session). Destroyed on `runner_stop` or `runner_stop_all`. A background watcher syncs result files back to local state dir when the remote agent finishes.
+- **Remote VM lifecycle**: exe.dev VMs persist between start/resume (same repo state + agent session). Only issue-attached tracked VMs are managed/destroyed by `runner_stop` or `runner_stop_all`; unrelated personal VMs are untouched. A background watcher syncs result files back to local state dir when the remote agent finishes.
 
 ## Dependencies
 

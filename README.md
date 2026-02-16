@@ -108,6 +108,7 @@ environments/my-project/
 ```
 
 VM lifecycle: provision on dispatch, clone repo, sync state, run agent, sync results back, destroy on stop. VMs are reused on resume.
+Managed VM names are standardized as `<repo>-<issue>` when possible (for example `psp-platform-vetta-365`).
 Before each remote start/resume, the provider credential file is SCP-injected to the VM via `provider_sync_credentials`.
 
 ### Adding a runner
@@ -118,8 +119,8 @@ Create `runners/<name>.sh` implementing 5 functions:
 runner_start ID STATE_DIR ENV_DIR AGENT_TYPE ACTION   # launch/resume
 runner_is_running ID                                   # exit 0 if active
 runner_stop ID                                         # kill agent
-runner_stop_all                                        # kill all agents
-runner_list                                            # print running agents
+runner_stop_all                                        # stop only issue-attached VMs tracked in STATE_DIR
+runner_list                                            # print only issue-attached managed VMs
 ```
 
 Set `RUNNER_TYPE=<name>` in `.env`. No changes to machine.sh or adapters.
