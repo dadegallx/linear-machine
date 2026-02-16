@@ -90,6 +90,9 @@ The system has seven layers connected by filesystem state:
 - **Exit code protocol**: 0 = success, 100 = blocked (agent chose to stop), other = crash.
 - **Runner/provider/adapter split**: `machine.sh → runner (where) → provider auth sync (credentials) → adapter (what)`. Add new remote auth behavior by creating `providers/<agent>.sh` with `provider_sync_credentials`; no runner rewrite needed.
 - **Remote VM lifecycle**: exe.dev VMs persist between start/resume (same repo state + agent session). Only issue-attached tracked VMs are managed/destroyed by `runner_stop` or `runner_stop_all`; unrelated personal VMs are untouched. A background watcher syncs result files back to local state dir when the remote agent finishes.
+- **Dispatch scope**: only mapped projects in `environments/mapping.conf` are dispatched. Completed/Canceled issues are skipped even if they still match mention search.
+- **Stop semantics**: `machine.sh stop` clears issue state folders under `/tmp/linear-agent/*/` so status starts clean and prior agent session memory is discarded.
+- **Remote bootstrap correctness**: exe runner copies `lib/linear.sh` to remote `~/lib`, rewrites `LINEAR_STATE_DIR` in remote env to `~/state/<id>`, and launches via `~/state/<id>/runner_cmd.sh` to avoid shell-escaping breakage.
 
 ## Dependencies
 

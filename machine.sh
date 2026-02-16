@@ -34,6 +34,14 @@ resolve_environment() {
   [ -d "$env_dir" ] && echo "$env_dir" || echo ""
 }
 
+is_project_tracked() {
+  local project_id="$1"
+  local mapping="$SCRIPT_DIR/environments/mapping.conf"
+  [ -z "$project_id" ] && return 1
+  [ ! -f "$mapping" ] && return 0
+  [ -n "$(read_config_var "$mapping" "$project_id")" ]
+}
+
 env_repo_path() {
   local env_dir="$1"
   [ -n "$env_dir" ] && [ -f "$env_dir/repo_path" ] && {
@@ -193,6 +201,13 @@ resume_comment_bundle() {
   '
 }
 
+latest_human_comment_ts() {
+  local issue="$1"
+  echo "$issue" | jq -r --arg aid "$AGENT_USER_ID" '
+    ([.comments.nodes[]? | select(.user.id != $aid)] | sort_by(.createdAt) | last | .createdAt) // ""
+  '
+}
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -271,6 +286,15 @@ ${err_snippet:-no error output captured}
   done
 }
 
+clear_issue_state_dirs() {
+  local state_dir
+  for state_dir in "$STATE_DIR"/*/; do
+    [ -d "$state_dir" ] || continue
+    [ -f "$state_dir/issue_uuid" ] || [ -f "$state_dir/title" ] || [ -f "$state_dir/workdir" ] || continue
+    rm -rf "$state_dir"
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Phase 2: poll Linear, dispatch or resume agents
 # ---------------------------------------------------------------------------
@@ -289,6 +313,19 @@ poll_and_dispatch() {
   local seen=""
   while IFS= read -r issue; do
     local issue_uuid id
+    local state_type state_name
+    local project_id
+    state_type=$(echo "$issue" | jq -r '.state.type // empty')
+    state_name=$(echo "$issue" | jq -r '.state.name // empty')
+    project_id=$(echo "$issue" | jq -r '.project.id // empty')
+    case "$state_type" in
+      completed|canceled) continue ;;
+    esac
+    case "$(echo "$state_name" | tr '[:upper:]' '[:lower:]')" in
+      done|canceled|cancelled) continue ;;
+    esac
+    is_project_tracked "$project_id" || continue
+
     issue_uuid=$(echo "$issue" | jq -r '.id')
     id=$(echo "$issue" | jq -r '.identifier' | tr '[:upper:]' '[:lower:]')
     # Dedup: skip if already seen this UUID in this cycle
@@ -302,6 +339,15 @@ poll_and_dispatch() {
 
     local state_dir="$STATE_DIR/$id"
     mkdir -p "$state_dir"
+
+    # Process each human comment trigger once per issue.
+    local latest_human_ts saved_ts
+    latest_human_ts=$(latest_human_comment_ts "$issue")
+    saved_ts=""
+    [ -f "$state_dir/posted_at" ] && saved_ts=$(cat "$state_dir/posted_at")
+    if [ -n "$latest_human_ts" ] && [ -n "$saved_ts" ] && ! [ "$latest_human_ts" \> "$saved_ts" ]; then
+      continue
+    fi
 
     if [ -f "$state_dir/session" ]; then
       check_and_resume "$issue" "$id" "$state_dir"
@@ -321,12 +367,13 @@ poll_and_dispatch() {
 # ---------------------------------------------------------------------------
 dispatch_new() {
   local issue="$1" id="$2" state_dir="$3"
-  local issue_uuid title project_id team_id assignee_id
+  local issue_uuid title project_id team_id assignee_id latest_human_ts
   issue_uuid=$(echo "$issue" | jq -r '.id')
   title=$(echo "$issue" | jq -r '.title')
   project_id=$(echo "$issue" | jq -r '.project.id // empty')
   team_id=$(echo "$issue" | jq -r '.team.id')
   assignee_id=$(echo "$issue" | jq -r '.assignee.id // empty')
+  latest_human_ts=$(latest_human_comment_ts "$issue")
 
   # Resolve environment
   local env_dir
@@ -344,11 +391,19 @@ dispatch_new() {
   echo "$team_id" > "$state_dir/team_id"
   echo "$workdir" > "$state_dir/workdir"
   echo "$assignee_id" > "$state_dir/last_assignee"
+  [ -n "$latest_human_ts" ] && echo "$latest_human_ts" > "$state_dir/posted_at"
   [ -n "$project_id" ] && echo "$project_id" > "$state_dir/project_id"
 
+  local start_rc=0
+  set +e
   runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "start"
-
-  log "Dispatched $AGENT_TYPE for $id: $title (env: ${env_dir:-legacy})"
+  start_rc=$?
+  set -e
+  if [ "$start_rc" -eq 0 ]; then
+    log "Dispatched $AGENT_TYPE for $id: $title (env: ${env_dir:-legacy})"
+  else
+    log "Dispatch failed for $id (infra/runtime start error)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -411,9 +466,16 @@ check_and_resume() {
   # Clear previous agent state for fresh resume
   rm -f "$state_dir/exit_code" "$state_dir/agent_state"
 
+  local resume_rc=0
+  set +e
   runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "resume"
-
-  log "Resumed $AGENT_TYPE for $id (new human comments detected)"
+  resume_rc=$?
+  set -e
+  if [ "$resume_rc" -eq 0 ]; then
+    log "Resumed $AGENT_TYPE for $id (new human comments detected)"
+  else
+    log "Resume failed for $id (infra/runtime start error)"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -466,6 +528,7 @@ cmd_stop() {
   fi
 
   runner_stop_all
+  clear_issue_state_dirs
   echo "Cleaned up agent sessions"
 }
 
