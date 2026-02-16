@@ -14,6 +14,32 @@ _exe_scp() {
   scp -o ConnectTimeout="$EXE_SSH_TIMEOUT" "$@"
 }
 
+_exe_slug() {
+  echo "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
+}
+
+_exe_managed_vm_name() {
+  local id="$1" state_dir="$2"
+  local repo repo_slug id_slug name
+  repo=$(basename "$(cat "$state_dir/workdir" 2>/dev/null || echo linear)")
+  repo_slug=$(_exe_slug "$repo")
+  id_slug=$(_exe_slug "$id")
+  name="${repo_slug:-linear}-${id_slug:-issue}"
+  echo "${name:0:56}"
+}
+
+_exe_each_managed_issue() {
+  local state_dir id
+  for state_dir in "$STATE_DIR"/*/; do
+    [ -d "$state_dir" ] || continue
+    [ -f "$state_dir/vm_name" ] || continue
+    id=$(basename "$state_dir")
+    echo "$id"
+  done
+}
+
 # ---------------------------------------------------------------------------
 # Background watcher: polls remote tmux, syncs results when done
 # ---------------------------------------------------------------------------
@@ -42,8 +68,9 @@ runner_start() {
 
   if [ "$action" = "start" ]; then
     # Spin up a new VM
-    local vm_json vm_name ssh_dest
-    vm_json=$(_exe_ssh exe.dev new --json)
+    local vm_json vm_name ssh_dest requested_name
+    requested_name=$(_exe_managed_vm_name "$id" "$state_dir")
+    vm_json=$(_exe_ssh exe.dev new --json --name "$requested_name" 2>/dev/null || _exe_ssh exe.dev new --json)
     vm_name=$(echo "$vm_json" | jq -r '.vm_name')
     ssh_dest=$(echo "$vm_json" | jq -r '.ssh_dest')
 
@@ -160,21 +187,24 @@ runner_stop() {
 # runner_stop_all
 # ---------------------------------------------------------------------------
 runner_stop_all() {
-  local vms
-  vms=$(_exe_ssh exe.dev ls --json 2>/dev/null) || return 0
-  while read -r vm; do
-    if [ -n "$vm" ]; then
-      _exe_ssh exe.dev rm "$vm" 2>/dev/null || true
-      log "VM destroyed: $vm"
-    fi
-  done < <(echo "$vms" | jq -r '.vms[].vm_name // empty')
+  local id
+  while read -r id; do
+    [ -n "$id" ] || continue
+    runner_stop "$id"
+  done < <(_exe_each_managed_issue)
 }
 
 # ---------------------------------------------------------------------------
 # runner_list
 # ---------------------------------------------------------------------------
 runner_list() {
-  local vms
-  vms=$(_exe_ssh exe.dev ls --json 2>/dev/null) || return 0
-  echo "$vms" | jq -r '.vms[] | .vm_name + " (" + .status + ")"'
+  local vms_json id vm status
+  vms_json=$(_exe_ssh exe.dev ls --json 2>/dev/null || true)
+  while read -r id; do
+    [ -n "$id" ] || continue
+    vm=$(cat "$STATE_DIR/$id/vm_name" 2>/dev/null || true)
+    [ -n "$vm" ] || continue
+    status=$(echo "$vms_json" | jq -r --arg vm "$vm" '[.vms[] | select(.vm_name == $vm) | .status][0] // "stopped"' 2>/dev/null || echo "unknown")
+    echo "$id: $vm ($status)"
+  done < <(_exe_each_managed_issue)
 }
