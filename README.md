@@ -25,10 +25,10 @@ comment      crash recovery   exe.dev VM          codex exec
 @mention                      your infra          your agent
 ```
 
-1. **Assign** an issue to the agent user — machine dispatches it
+1. **Trigger** by assigning to agent or mentioning `@<agent-name>` in comments
 2. **Agent works** — self-assigns, moves to In Progress, posts updates
 3. **Agent finishes** — posts summary, moves to In Review
-4. **You reply** — machine resumes the same session (full context preserved)
+4. **You reply** — machine resumes the same session with all new human comments since the latest agent comment
 5. **Agent is stuck** — moves to Blocked and stops; resumes when you respond
 6. **Repeat** until done
 
@@ -50,10 +50,11 @@ Every step is visible in Linear. The agent shows up as a teammate — comments, 
    ```bash
    ./machine.sh start    # start polling
    ./machine.sh status   # check agents
-   ./machine.sh stop     # stop everything
+   ./machine.sh stop     # interactive warning: session memory is lost
+   ./machine.sh stop --yes   # non-interactive stop
    ```
 
-4. Assign an issue to your agent user in Linear. Watch it work:
+4. Assign to the agent user (or mention `@Francis`) in Linear. Watch it work:
    ```bash
    tmux attach -t linear-per-50       # live agent session
    tail -f /tmp/linear-agent/machine.log   # supervisor log

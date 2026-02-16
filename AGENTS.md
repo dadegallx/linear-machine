@@ -6,13 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A shell-based bridge that polls Linear for issues assigned to an agent user, dispatches coding agents (Codex or Claude Code) in tmux sessions. Agents manage their own Linear workflow — assigning issues, updating status, posting comments — via `bin/linear-tool`. Machine.sh is a lightweight supervisor: dispatch + crash recovery + resume on human reply.
 
-The full lifecycle: **Todo** → machine dispatches agent → agent self-assigns + moves to **In Progress** → agent works → agent posts comment + moves to **In Review** → human replies → machine resumes agent → repeat. If the agent is stuck, it moves to **Blocked** and stops; machine resumes when a human replies.
+The full lifecycle: assigned-or-mentioned issue triggers dispatch/resume → agent comments first, then works → agent owns status transitions (**In Progress**, **Blocked**, **In Review**) → human replies in comments → machine resumes with new human comment bundle.
 
 ## Commands
 
 ```bash
 ./machine.sh start    # Start polling loop (background)
-./machine.sh stop     # Stop loop + kill all agent tmux sessions
+./machine.sh stop     # Stop loop (warns that session memory/context will be lost)
+./machine.sh stop --yes  # Non-interactive stop
 ./machine.sh status   # Show running agents and tracked issues
 ```
 
@@ -27,7 +28,7 @@ The system has seven layers connected by filesystem state:
 
 1. **`machine.sh`** — Lightweight supervisor. Runs two phases each cycle:
    - `handle_finished_agents`: checks `runner_is_running` for each tracked issue. Exit code 0 = success (agent handled everything). Exit code 100 = blocked (agent signaled via linear-tool). Other = crash → posts error comment, moves issue to Blocked.
-   - `poll_and_dispatch`: queries Linear for ALL issues assigned to agent (no state filter), plus @mentions. Filters by state name: Todo → dispatch new, In Review/Blocked → check for human reply and resume.
+   - `poll_and_dispatch`: queries Linear for assigned issues plus @mentions. If a local `session` exists for the issue, it resumes; otherwise it dispatches a new run.
    - `build_prompt`: writes enriched prompt with tool docs and workflow instructions.
    - `write_agent_env`: writes `$state_dir/env.sh` with Linear-specific vars for `linear-tool`.
    - Environment helpers: `resolve_environment`, `env_repo_path`.
@@ -80,7 +81,7 @@ The system has seven layers connected by filesystem state:
 ## Key Design Decisions
 
 - The Linear API key must belong to the **agent user account**, not a personal account. This is how the script distinguishes agent comments from human comments when deciding whether to resume.
-- **Agents own their workflow**: agents call `linear-tool` to assign, update status, and post comments. Machine.sh only intervenes on crash (posts error comment, moves to Blocked).
+- **Agents own their workflow**: agents call `linear-tool` to update status and post comments (must comment before implementing). Machine.sh only intervenes on crash (posts error comment, moves to Blocked).
 - **No hardcoded status UUIDs**: workflow state names (e.g. "In Progress", "Blocked") are resolved to UUIDs dynamically via the Linear API. Cached per-session in `workflow_states.json`.
 - GraphQL payloads are built via `python3 -c "import json; ..."` rather than string interpolation, because issue descriptions and comments contain arbitrary text that would break JSON if shell-escaped.
 - `POLL_INTERVAL`, `STATE_DIR`, `REPOS_DIR`, `AGENT_TYPE`, `AGENT_DISPLAY_NAME`, and `RUNNER_TYPE` are configured in `.env`.
