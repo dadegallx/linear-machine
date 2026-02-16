@@ -2,165 +2,139 @@
 
 **Tag an issue. Your agent handles the rest.**
 
-A self-hosted implementation of [Linear for Agents](https://linear.app/agents) — bring your own coding agent, bring your own infrastructure. No vendor lock-in, no third-party routing, no black boxes. Your code stays on your machines.
+A self-hosted implementation of [Linear for Agents](https://linear.app/agents) using your own agent CLI and infrastructure.
 
-## Why
+## What Changed
 
-Linear's [agent ecosystem](https://linear.app/agents) lets you assign issues to AI agents like Devin or Codegen. But those agents run on someone else's infrastructure, with someone else's access to your repos.
+Linear Machine is now **webhook-first**:
 
-Linear Machine gives you the same workflow — assign an issue, agent picks it up, works it, posts updates, asks for help when stuck — except:
+- Primary triggers come from Linear webhooks (`commentCreate`, `issueUpdate` for assignee changes).
+- Events are durably queued in SQLite with idempotency + per-comment dedupe.
+- A worker processes events with per-issue locks and persistent session state.
+- Polling remains only as a fallback reconciler.
 
-- **Bring your own agent.** Claude Code, Codex, or anything with a CLI. Swap with one line.
-- **Bring your own infra.** Local tmux, remote VMs via [exe.dev](https://exe.dev), or write your own runner.
-- **Your data stays yours.** Your Linear API key, your repos, your machines. Nothing leaves your environment.
+## Trigger Rules
 
-The whole thing is ~500 lines of bash. No framework, no runtime, no dependencies beyond `curl`, `jq`, `tmux`, and your agent CLI.
+Dispatch/resume happens only when:
 
-## How It Works
+1. Issue is assigned to the agent user, or
+2. A new **human** comment contains `@<agent-name>` (case-insensitive)
 
-```
-Linear  ←→  machine.sh  ←→  runner (where)  ←→  adapter (what)
-assign       poll/dispatch    local tmux          claude -p
-comment      crash recovery   exe.dev VM          codex exec
-@mention                      your infra          your agent
-```
+Ignored:
 
-1. **Trigger** by assigning to agent or mentioning `@<agent-name>` in comments
-2. **Agent works** — self-assigns, moves to In Progress, posts updates
-3. **Agent finishes** — posts summary, moves to In Review
-4. **You reply** — machine resumes the same session with all new human comments since the latest agent comment
-5. **Agent is stuck** — moves to Blocked and stops; resumes when you respond
-6. **Repeat** until done
-
-Every step is visible in Linear. The agent shows up as a teammate — comments, status changes, the full audit trail.
+- Agent-authored comments (`actor_id == AGENT_USER_ID`)
+- Closed/canceled issues
+- Duplicate webhook deliveries/comments
 
 ## Quick Start
 
-1. Copy `.env.example` to `.env`:
-   ```bash
-   LINEAR_API_KEY=lin_api_...   # API key for the agent user account
-   AGENT_USER_ID=...            # Linear user ID of the agent
-   AGENT_TYPE=claude             # "claude" or "codex"
-   REPOS_DIR=~/Repos            # where your repos live
-   ```
-
-2. Install dependencies: `curl`, `jq`, `tmux`, `python3`, and your agent CLI.
-
-3. Run:
-   ```bash
-   ./machine.sh start    # start polling
-   ./machine.sh status   # check agents
-   ./machine.sh stop     # interactive warning: session memory is lost
-   ./machine.sh stop --yes   # non-interactive stop
-   ```
-
-4. Assign to the agent user (or mention `@Francis`) in Linear. Watch it work:
-   ```bash
-   tmux attach -t linear-per-50       # live agent session
-   tail -f /tmp/linear-agent/machine.log   # supervisor log
-   ```
-
-## Agents
-
-Swap agents with one line in `.env`:
+1. Configure `.env`:
 
 ```bash
-AGENT_TYPE=claude   # Claude Code (claude -p / --resume)
-AGENT_TYPE=codex    # OpenAI Codex (codex exec / resume)
+LINEAR_API_KEY=lin_api_...
+AGENT_USER_ID=...
+AGENT_TYPE=claude                 # or codex
+RUNNER_TYPE=local                 # or exe
+STATE_DIR=/tmp/linear-agent
+LINEAR_WEBHOOK_SECRET=...         # required
+WEBHOOK_HOST=0.0.0.0              # optional
+WEBHOOK_PORT=8787                 # optional
+WEBHOOK_PATH=/webhooks/linear     # optional
+RECONCILER_INTERVAL=300           # optional fallback cadence
 ```
 
-Both adapters expose the same interface: `start STATE_DIR WORKDIR` and `resume STATE_DIR`. Adding a new agent means writing one adapter script.
-
-Provider auth sync is modular too: each provider script implements `provider_sync_credentials SSH_DEST`, and remote runners call it before start/resume.
-
-## Runners
-
-Runners control **where** agents execute. Adapters control **which** agent runs.
-
-### Local (default)
-
-Agents run in tmux sessions on this machine. No extra config.
+2. Start machine:
 
 ```bash
-RUNNER_TYPE=local    # or just omit — this is the default
+./machine.sh start
 ```
 
-### exe.dev
+3. Register Linear webhook URL:
 
-Agents run on managed VMs via [exe.dev](https://exe.dev). Each issue gets its own VM that persists across resume cycles.
+```text
+http://<host>:8787/webhooks/linear
+```
+
+4. Check runtime:
 
 ```bash
-RUNNER_TYPE=exe
-EXE_REPOS_DIR=~/repos    # where repos land on VMs (default)
-
-# Optional auth file overrides for remote auth injection:
-CODEX_AUTH_FILE=~/.codex/auth.json
-CODEX_REMOTE_AUTH_FILE=~/.codex/auth.json
-CLAUDE_AUTH_FILE=~/.claude/.credentials.json
-CLAUDE_REMOTE_AUTH_FILE=~/.claude/.credentials.json
+./machine.sh status
 ```
 
-Per-environment, add a `repo_url` file so the runner knows what to clone:
-```
-environments/my-project/
-  repo_path   → /Users/you/Repos/my-project       (local runner)
-  repo_url    → https://github.com/org/my-project  (remote runners clone this)
-```
-
-VM lifecycle: provision on dispatch, clone repo, sync state, run agent, sync results back, destroy on stop. VMs are reused on resume.
-Managed VM names are standardized as `<repo>-<issue>` when possible (for example `psp-platform-vetta-365`).
-Before each remote start/resume, the provider credential file is SCP-injected to the VM via `provider_sync_credentials`.
-
-### Adding a runner
-
-Create `runners/<name>.sh` implementing 5 functions:
+## Commands
 
 ```bash
-runner_start ID STATE_DIR ENV_DIR AGENT_TYPE ACTION   # launch/resume
-runner_is_running ID                                   # exit 0 if active
-runner_stop ID                                         # kill agent
-runner_stop_all                                        # stop only issue-attached VMs tracked in STATE_DIR
-runner_list                                            # print only issue-attached managed VMs
+./machine.sh start
+./machine.sh stop
+./machine.sh status
+./machine.sh cleanup --issues
+./machine.sh debug issue <issue-id-or-identifier>
+./machine.sh run-reconciler
 ```
-
-Set `RUNNER_TYPE=<name>` in `.env`. No changes to machine.sh or adapters.
 
 ## Architecture
 
 ```
-linear-machine/
-├── machine.sh           # Supervisor: poll → dispatch → crash recovery
-├── runners/
-│   ├── local.sh         # Local tmux sessions (default)
-│   └── exe.sh           # exe.dev managed VMs
-├── adapters/
-│   ├── codex.sh         # codex exec / codex exec resume
-│   └── claude.sh        # claude -p / claude --resume
-├── providers/
-│   ├── base.sh          # shared credential sync helpers
-│   ├── codex.sh         # codex auth file sync
-│   └── claude.sh        # claude auth file sync
-├── lib/
-│   ├── linear.sh        # Linear GraphQL API (curl + jq)
-│   ├── provider.sh      # Provider loader (auth sync contract)
-│   └── runner.sh        # Runner loader + contract validation
-├── environments/        # Per-project config (mapping, repo paths, env vars)
-├── bin/
-│   └── linear-tool      # Agent-callable CLI for Linear operations
-└── .env                 # Secrets + config (git-ignored)
+Linear webhooks --> bin/linear-webhook-listener --> SQLite queue (bin/state-store)
+                                                      |
+                                                      v
+                                              machine.sh worker loop
+                                                      |
+                                              runner + adapter
+                                                      |
+                                                  agent CLI
 ```
 
-State lives in `/tmp/linear-agent/<issue-id>/`:
-- `prompt` — current prompt sent to agent
-- `session` — agent session/thread ID (for resume)
-- `output` — agent's response
-- `exit_code` — 0 success, 100 blocked, other crash
-- `raw.json` / `raw.jsonl` — full agent output for debugging
-- `vm_name`, `ssh_dest` — VM identity (remote runners only)
+Key files:
 
-## Notes
+- `machine.sh` — worker loop, reconciler fallback, lifecycle/status/debug commands
+- `bin/linear-webhook-listener` — HTTP intake + signature/timestamp validation + enqueue
+- `bin/state-store` — durable queue/session store (SQLite)
+- `lib/event_parser.py` — webhook parsing, signature checks, mention matcher
+- `lib/linear.sh` — Linear GraphQL calls
+- `runners/*`, `adapters/*`, `providers/*` — unchanged execution contracts
 
-- The API key must belong to the **agent user account**, not your personal account. This is how the system distinguishes agent comments from human comments.
-- Workflow states (In Progress, Blocked, In Review) are resolved by name via the Linear API — no hardcoded UUIDs. Works with any team's workflow.
-- Agents own their lifecycle: they call `linear-tool` to assign, update status, and post comments. The supervisor only intervenes on crash.
-- Each resume preserves full prior context — file reads, tool calls, reasoning. The agent picks up exactly where it left off.
+## Runtime State Model
+
+Durable source of truth: `STATE_DB` (`$STATE_DIR/state.db`):
+
+- `events`: pending/processing/done/failed + retries + dedupe keys
+- `issue_sessions`: per-issue session state (`active_session_id`, last comment markers, VM metadata, status)
+- `issue_locks`: per-issue lease for single-worker semantics
+- `event_timeline`: debug timeline and structured action history
+
+Filesystem state under `/tmp/linear-agent/<issue-id>/` remains runtime cache for adapters/runners.
+
+## Lifecycle Semantics
+
+- `start`: initializes DB, starts webhook listener + worker loop
+- `stop`: stops worker/listener only (does **not** destroy unrelated VMs)
+- `cleanup --issues`: explicit cleanup for issue-bound runtime state/VMs
+
+## Testing
+
+Run local test suite:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+Real E2E acceptance test:
+
+```bash
+LINEAR_E2E_TEAM_ID=<team-id> LINEAR_E2E_PROJECT_ID=<project-id-optional> \
+  tests/e2e_linear_mention.sh
+```
+
+E2E flow:
+
+1. Create new issue
+2. Post `@francis are you there?`
+3. Wait for Francis reply comment
+4. Fail if no reply before timeout
+
+## Dependencies
+
+- `curl`, `jq`, `tmux`, `python3`
+- agent CLI (`claude` or `codex`)
+- optional `trash` command for safer runtime-cache deletion

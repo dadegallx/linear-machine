@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""Durable SQLite-backed state store for linear-machine."""
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
+
+def fmt_ts(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def utc_now_iso() -> str:
+    return fmt_ts(datetime.now(timezone.utc))
+
+
+def parse_iso(ts: str) -> datetime:
+    if not ts:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+class Store:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        parent = os.path.dirname(db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def init(self) -> None:
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_id TEXT NOT NULL UNIQUE,
+              source TEXT NOT NULL,
+              event_type TEXT NOT NULL,
+              issue_id TEXT,
+              issue_identifier TEXT,
+              comment_id TEXT,
+              actor_id TEXT,
+              assignee_id TEXT,
+              mention_text TEXT,
+              contains_mention INTEGER NOT NULL DEFAULT 0,
+              payload_json TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              retry_count INTEGER NOT NULL DEFAULT 0,
+              next_attempt_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+              processing_started_at TEXT,
+              done_at TEXT,
+              failed_at TEXT,
+              last_error TEXT,
+              created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+              updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_events_issue_comment
+            ON events(issue_id, comment_id)
+            WHERE comment_id IS NOT NULL AND comment_id <> '';
+
+            CREATE INDEX IF NOT EXISTS idx_events_status_attempt
+            ON events(status, next_attempt_at);
+
+            CREATE INDEX IF NOT EXISTS idx_events_issue
+            ON events(issue_id);
+
+            CREATE TABLE IF NOT EXISTS issue_sessions (
+              issue_id TEXT PRIMARY KEY,
+              issue_identifier TEXT,
+              active_session_id TEXT,
+              last_processed_comment_id TEXT,
+              last_human_comment_ts TEXT,
+              vm_name TEXT,
+              ssh_dest TEXT,
+              status TEXT NOT NULL DEFAULT 'idle',
+              last_assignee_id TEXT,
+              project_id TEXT,
+              team_id TEXT,
+              state_dir TEXT,
+              last_event_id TEXT,
+              last_error TEXT,
+              created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+              updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS issue_locks (
+              issue_id TEXT PRIMARY KEY,
+              lease_owner TEXT NOT NULL,
+              lease_expires_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS event_timeline (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_id TEXT,
+              issue_id TEXT,
+              action TEXT NOT NULL,
+              result TEXT NOT NULL,
+              duration_ms INTEGER,
+              message TEXT,
+              created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_timeline_issue ON event_timeline(issue_id, created_at);
+            """
+        )
+        self.conn.commit()
+
+    def enqueue(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        now = utc_now_iso()
+        event_id = event.get("event_id") or str(uuid.uuid4())
+        payload_json = json.dumps(event.get("payload", {}), separators=(",", ":"), sort_keys=True)
+        values = (
+            event_id,
+            event.get("source") or "webhook",
+            event.get("event_type") or "unknown",
+            event.get("issue_id"),
+            event.get("issue_identifier"),
+            event.get("comment_id"),
+            event.get("actor_id"),
+            event.get("assignee_id"),
+            event.get("mention_text"),
+            1 if event.get("contains_mention") else 0,
+            payload_json,
+            now,
+            now,
+        )
+        try:
+            self.conn.execute(
+                """
+                INSERT INTO events (
+                  event_id, source, event_type, issue_id, issue_identifier, comment_id,
+                  actor_id, assignee_id, mention_text, contains_mention, payload_json,
+                  created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            self.conn.commit()
+            return {"inserted": True, "duplicate": False, "event_id": event_id}
+        except sqlite3.IntegrityError:
+            row = self.conn.execute(
+                "SELECT event_id, status FROM events WHERE event_id = ? OR (issue_id = ? AND comment_id = ? AND ? IS NOT NULL)",
+                (event_id, event.get("issue_id"), event.get("comment_id"), event.get("comment_id")),
+            ).fetchone()
+            return {
+                "inserted": False,
+                "duplicate": True,
+                "event_id": (row["event_id"] if row else event_id),
+                "status": (row["status"] if row else "unknown"),
+            }
+
+    def claim_next(self, worker_id: str, stale_after_sec: int = 900) -> Dict[str, Any]:
+        now = utc_now_iso()
+        stale_cutoff = fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=stale_after_sec))
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE events
+                SET status = 'pending', updated_at = ?
+                WHERE status = 'processing' AND processing_started_at < ?
+                """,
+                (now, stale_cutoff),
+            )
+
+            row = self.conn.execute(
+                """
+                SELECT * FROM events
+                WHERE status = 'pending' AND next_attempt_at <= ?
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+
+            if row is None:
+                return {"claimed": False}
+
+            self.conn.execute(
+                """
+                UPDATE events
+                SET status = 'processing',
+                    processing_started_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, row["id"]),
+            )
+
+        out = dict(row)
+        out["payload"] = json.loads(out.pop("payload_json") or "{}")
+        out["claimed"] = True
+        out["worker_id"] = worker_id
+        return out
+
+    def mark_done(self, event_id: str) -> None:
+        now = utc_now_iso()
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE events
+                SET status = 'done', done_at = ?, updated_at = ?, last_error = NULL
+                WHERE event_id = ?
+                """,
+                (now, now, event_id),
+            )
+
+    def mark_failed(self, event_id: str, error: str, retry: bool, backoff_sec: int) -> None:
+        now = utc_now_iso()
+        next_attempt = fmt_ts(datetime.now(timezone.utc) + timedelta(seconds=backoff_sec))
+        with self.conn:
+            if retry:
+                self.conn.execute(
+                    """
+                    UPDATE events
+                    SET status = 'pending', retry_count = retry_count + 1, next_attempt_at = ?,
+                        failed_at = ?, updated_at = ?, last_error = ?
+                    WHERE event_id = ?
+                    """,
+                    (next_attempt, now, now, error, event_id),
+                )
+            else:
+                self.conn.execute(
+                    """
+                    UPDATE events
+                    SET status = 'failed', retry_count = retry_count + 1,
+                        failed_at = ?, updated_at = ?, last_error = ?
+                    WHERE event_id = ?
+                    """,
+                    (now, now, error, event_id),
+                )
+
+    def acquire_lock(self, issue_id: str, owner: str, lease_sec: int) -> Dict[str, Any]:
+        now_dt = datetime.now(timezone.utc)
+        now = fmt_ts(now_dt)
+        expires = fmt_ts(now_dt + timedelta(seconds=lease_sec))
+
+        with self.conn:
+            row = self.conn.execute(
+                "SELECT lease_owner, lease_expires_at FROM issue_locks WHERE issue_id = ?",
+                (issue_id,),
+            ).fetchone()
+
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO issue_locks(issue_id, lease_owner, lease_expires_at, updated_at) VALUES(?, ?, ?, ?)",
+                    (issue_id, owner, expires, now),
+                )
+                return {"acquired": True, "owner": owner, "expires_at": expires}
+
+            row_exp = parse_iso(row["lease_expires_at"])
+            if row["lease_owner"] == owner or row_exp <= now_dt:
+                self.conn.execute(
+                    """
+                    UPDATE issue_locks
+                    SET lease_owner = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE issue_id = ?
+                    """,
+                    (owner, expires, now, issue_id),
+                )
+                return {"acquired": True, "owner": owner, "expires_at": expires}
+
+            return {
+                "acquired": False,
+                "owner": row["lease_owner"],
+                "expires_at": row["lease_expires_at"],
+            }
+
+    def release_lock(self, issue_id: str, owner: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM issue_locks WHERE issue_id = ? AND lease_owner = ?",
+                (issue_id, owner),
+            )
+
+    def upsert_session(self, issue_id: str, fields: Dict[str, Any]) -> None:
+        now = utc_now_iso()
+        cols = ["issue_id", "updated_at"]
+        vals: list[Any] = [issue_id, now]
+        for key, value in fields.items():
+            if key not in {
+                "issue_identifier",
+                "active_session_id",
+                "last_processed_comment_id",
+                "last_human_comment_ts",
+                "vm_name",
+                "ssh_dest",
+                "status",
+                "last_assignee_id",
+                "project_id",
+                "team_id",
+                "state_dir",
+                "last_event_id",
+                "last_error",
+            }:
+                continue
+            cols.append(key)
+            vals.append(value)
+
+        insert_cols = ",".join(cols)
+        placeholders = ",".join(["?"] * len(cols))
+        updates = ",".join([f"{c}=excluded.{c}" for c in cols if c != "issue_id"])
+
+        with self.conn:
+            self.conn.execute(
+                f"INSERT INTO issue_sessions ({insert_cols}) VALUES ({placeholders}) "
+                f"ON CONFLICT(issue_id) DO UPDATE SET {updates}",
+                vals,
+            )
+
+    def get_session(self, issue_id: str) -> Dict[str, Any]:
+        row = self.conn.execute("SELECT * FROM issue_sessions WHERE issue_id = ?", (issue_id,)).fetchone()
+        return dict(row) if row else {}
+
+    def list_sessions(self) -> Dict[str, Any]:
+        rows = self.conn.execute(
+            "SELECT * FROM issue_sessions ORDER BY updated_at DESC"
+        ).fetchall()
+        return {"sessions": [dict(r) for r in rows]}
+
+    def queue_stats(self) -> Dict[str, Any]:
+        counts = {
+            "pending": 0,
+            "processing": 0,
+            "done": 0,
+            "failed": 0,
+            "dedupe_drops": 0,
+            "total": 0,
+            "events_received_last_minute": 0,
+            "events_received_per_sec": 0.0,
+            "dispatch_success": 0,
+            "dispatch_fail": 0,
+            "comment_to_dispatch_latency_ms_avg": None,
+        }
+        for row in self.conn.execute("SELECT status, COUNT(*) AS n FROM events GROUP BY status"):
+            counts[row["status"]] = row["n"]
+            counts["total"] += row["n"]
+
+        drops = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM event_timeline WHERE action = 'enqueue' AND result = 'duplicate'"
+        ).fetchone()
+        counts["dedupe_drops"] = drops["n"] if drops else 0
+
+        received = self.conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM events
+            WHERE created_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-60 seconds')
+            """
+        ).fetchone()
+        counts["events_received_last_minute"] = received["n"] if received else 0
+        counts["events_received_per_sec"] = round(counts["events_received_last_minute"] / 60.0, 3)
+
+        dispatch_success = self.conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM event_timeline
+            WHERE action IN ('dispatch', 'resume') AND result = 'ok'
+            """
+        ).fetchone()
+        counts["dispatch_success"] = dispatch_success["n"] if dispatch_success else 0
+
+        dispatch_fail = self.conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM event_timeline
+            WHERE action = 'process' AND result IN ('failed', 'retry')
+            """
+        ).fetchone()
+        counts["dispatch_fail"] = dispatch_fail["n"] if dispatch_fail else 0
+
+        latency = self.conn.execute(
+            """
+            SELECT AVG((julianday(t.created_at) - julianday(e.created_at)) * 86400000.0) AS avg_ms
+            FROM events e
+            JOIN event_timeline t ON t.event_id = e.event_id
+            WHERE e.event_type = 'comment.create'
+              AND t.action IN ('dispatch', 'resume')
+              AND t.result = 'ok'
+            """
+        ).fetchone()
+        avg_ms = latency["avg_ms"] if latency else None
+        counts["comment_to_dispatch_latency_ms_avg"] = round(avg_ms, 2) if avg_ms is not None else None
+        return counts
+
+    def timeline_add(
+        self,
+        event_id: Optional[str],
+        issue_id: Optional[str],
+        action: str,
+        result: str,
+        duration_ms: Optional[int],
+        message: Optional[str],
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO event_timeline(event_id, issue_id, action, result, duration_ms, message)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (event_id, issue_id, action, result, duration_ms, message),
+            )
+
+    def timeline_for_issue(self, issue_id: str, limit: int) -> Dict[str, Any]:
+        rows = self.conn.execute(
+            """
+            SELECT created_at, event_id, action, result, duration_ms, message
+            FROM event_timeline
+            WHERE issue_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (issue_id, limit),
+        ).fetchall()
+        return {"issue_id": issue_id, "events": [dict(r) for r in rows]}
+
+
+def parse_json(value: str) -> Dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid JSON: {exc}") from exc
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="state-store")
+    parser.add_argument("--db", required=True, help="path to sqlite db")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init")
+
+    p_enqueue = sub.add_parser("enqueue")
+    p_enqueue.add_argument("--event", required=True, help="event JSON")
+
+    p_claim = sub.add_parser("claim-next")
+    p_claim.add_argument("--worker-id", required=True)
+    p_claim.add_argument("--stale-after-sec", type=int, default=900)
+
+    p_done = sub.add_parser("mark-done")
+    p_done.add_argument("--event-id", required=True)
+
+    p_failed = sub.add_parser("mark-failed")
+    p_failed.add_argument("--event-id", required=True)
+    p_failed.add_argument("--error", required=True)
+    p_failed.add_argument("--retry", action="store_true")
+    p_failed.add_argument("--backoff-sec", type=int, default=60)
+
+    p_lock = sub.add_parser("acquire-lock")
+    p_lock.add_argument("--issue-id", required=True)
+    p_lock.add_argument("--owner", required=True)
+    p_lock.add_argument("--lease-sec", type=int, default=900)
+
+    p_unlock = sub.add_parser("release-lock")
+    p_unlock.add_argument("--issue-id", required=True)
+    p_unlock.add_argument("--owner", required=True)
+
+    p_upsert = sub.add_parser("upsert-session")
+    p_upsert.add_argument("--issue-id", required=True)
+    p_upsert.add_argument("--fields", required=True)
+
+    p_get = sub.add_parser("get-session")
+    p_get.add_argument("--issue-id", required=True)
+
+    sub.add_parser("list-sessions")
+    sub.add_parser("queue-stats")
+
+    p_tl = sub.add_parser("timeline-add")
+    p_tl.add_argument("--event-id")
+    p_tl.add_argument("--issue-id")
+    p_tl.add_argument("--action", required=True)
+    p_tl.add_argument("--result", required=True)
+    p_tl.add_argument("--duration-ms", type=int)
+    p_tl.add_argument("--message")
+
+    p_tli = sub.add_parser("timeline-issue")
+    p_tli.add_argument("--issue-id", required=True)
+    p_tli.add_argument("--limit", type=int, default=50)
+
+    args = parser.parse_args()
+
+    store = Store(args.db)
+    try:
+        if args.cmd == "init":
+            store.init()
+            print(json.dumps({"ok": True}))
+            return 0
+
+        if args.cmd == "enqueue":
+            result = store.enqueue(parse_json(args.event))
+            print(json.dumps(result))
+            return 0
+
+        if args.cmd == "claim-next":
+            print(json.dumps(store.claim_next(args.worker_id, args.stale_after_sec)))
+            return 0
+
+        if args.cmd == "mark-done":
+            store.mark_done(args.event_id)
+            print(json.dumps({"ok": True}))
+            return 0
+
+        if args.cmd == "mark-failed":
+            store.mark_failed(args.event_id, args.error, args.retry, args.backoff_sec)
+            print(json.dumps({"ok": True}))
+            return 0
+
+        if args.cmd == "acquire-lock":
+            print(json.dumps(store.acquire_lock(args.issue_id, args.owner, args.lease_sec)))
+            return 0
+
+        if args.cmd == "release-lock":
+            store.release_lock(args.issue_id, args.owner)
+            print(json.dumps({"ok": True}))
+            return 0
+
+        if args.cmd == "upsert-session":
+            store.upsert_session(args.issue_id, parse_json(args.fields))
+            print(json.dumps({"ok": True}))
+            return 0
+
+        if args.cmd == "get-session":
+            print(json.dumps(store.get_session(args.issue_id)))
+            return 0
+
+        if args.cmd == "list-sessions":
+            print(json.dumps(store.list_sessions()))
+            return 0
+
+        if args.cmd == "queue-stats":
+            print(json.dumps(store.queue_stats()))
+            return 0
+
+        if args.cmd == "timeline-add":
+            store.timeline_add(
+                args.event_id,
+                args.issue_id,
+                args.action,
+                args.result,
+                args.duration_ms,
+                args.message,
+            )
+            print(json.dumps({"ok": True}))
+            return 0
+
+        if args.cmd == "timeline-issue":
+            print(json.dumps(store.timeline_for_issue(args.issue_id, args.limit)))
+            return 0
+
+        parser.error(f"unknown cmd: {args.cmd}")
+        return 1
+    finally:
+        store.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

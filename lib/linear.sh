@@ -75,6 +75,16 @@ print(json.dumps({'query': q, 'variables': {'id': sys.argv[1]}}))" "$issue_id")
   linear_gql "$payload"
 }
 
+linear_get_issue_context() {
+  local issue_id="$1"
+  local payload
+  payload=$(python3 -c "
+import json, sys
+q = 'query(\$id: String!) { issue(id: \$id) { id identifier title description state { id name type } assignee { id } project { id name } team { id } comments(last: 50) { nodes { id body createdAt user { id displayName } } } } }'
+print(json.dumps({'query': q, 'variables': {'id': sys.argv[1]}}))" "$issue_id")
+  linear_gql "$payload"
+}
+
 linear_get_workflow_states() {
   local team_id="$1"
   local payload

@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""Linear webhook intake service: verify + enqueue + fast ACK."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict, Optional
+
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, SCRIPT_DIR)
+
+from lib.event_parser import (  # noqa: E402
+    is_timestamp_fresh,
+    make_fallback_event_id,
+    parse_event,
+    parse_json_bytes,
+    verify_linear_signature,
+)
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "linear-machine-webhook/1.0"
+
+    def _json(self, status: int, payload: Dict[str, Any]) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != self.server.path:  # type: ignore[attr-defined]
+            self._json(404, {"error": "not_found"})
+            return
+
+        length = int(self.headers.get("Content-Length") or "0")
+        raw = self.rfile.read(length)
+
+        secret = self.server.webhook_secret  # type: ignore[attr-defined]
+        sig_header = self.headers.get("Linear-Signature", "")
+        if not verify_linear_signature(raw, sig_header, secret):
+            self._json(401, {"error": "invalid_signature"})
+            return
+
+        try:
+            payload = parse_json_bytes(raw)
+        except json.JSONDecodeError:
+            self._json(400, {"error": "invalid_json"})
+            return
+
+        if not is_timestamp_fresh(payload, self.server.max_age_seconds):  # type: ignore[attr-defined]
+            self._json(401, {"error": "stale_or_missing_timestamp"})
+            return
+
+        fallback_id = make_fallback_event_id(raw)
+        event = parse_event(payload, agent_name=self.server.agent_name, fallback_event_id=fallback_id)  # type: ignore[attr-defined]
+
+        enqueue_result = enqueue_event(self.server.db_path, event)
+        event_id = enqueue_result.get("event_id") or event.get("event_id")
+
+        if enqueue_result.get("duplicate"):
+            timeline_add(
+                self.server.db_path,
+                event_id=event_id,
+                issue_id=event.get("issue_id"),
+                action="enqueue",
+                result="duplicate",
+                duration_ms=None,
+                message="webhook dedupe drop",
+            )
+            self._json(200, {"ok": True, "duplicate": True, "event_id": event_id})
+            return
+
+        timeline_add(
+            self.server.db_path,
+            event_id=event_id,
+            issue_id=event.get("issue_id"),
+            action="enqueue",
+            result="accepted",
+            duration_ms=None,
+            message="webhook accepted",
+        )
+        self._json(200, {"ok": True, "event_id": event_id})
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        msg = fmt % args
+        print(f"[webhook] {msg}", flush=True)
+
+
+def run_store(db_path: str, args: list[str]) -> Dict[str, Any]:
+    cmd = [os.path.join(SCRIPT_DIR, "bin", "state-store"), "--db", db_path] + args
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"state-store failed: {' '.join(cmd)}: {result.stderr.strip()}")
+    return json.loads(result.stdout or "{}")
+
+
+def enqueue_event(db_path: str, event: Dict[str, Any]) -> Dict[str, Any]:
+    return run_store(db_path, ["enqueue", "--event", json.dumps(event)])
+
+
+def timeline_add(
+    db_path: str,
+    *,
+    event_id: str,
+    issue_id: str,
+    action: str,
+    result: str,
+    duration_ms: Optional[int],
+    message: str,
+) -> None:
+    args = [
+        "timeline-add",
+        "--event-id",
+        event_id or "",
+        "--issue-id",
+        issue_id or "",
+        "--action",
+        action,
+        "--result",
+        result,
+        "--message",
+        message,
+    ]
+    if duration_ms is not None:
+        args.extend(["--duration-ms", str(duration_ms)])
+    run_store(db_path, args)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="linear-webhook-listener")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8787)
+    parser.add_argument("--path", default="/webhooks/linear")
+    parser.add_argument("--db", required=True)
+    parser.add_argument("--webhook-secret", required=True)
+    parser.add_argument("--agent-name", required=True)
+    parser.add_argument("--max-age-seconds", type=int, default=300)
+    args = parser.parse_args()
+
+    run_store(args.db, ["init"])
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.path = args.path
+    server.db_path = args.db
+    server.webhook_secret = args.webhook_secret
+    server.agent_name = args.agent_name
+    server.max_age_seconds = args.max_age_seconds
+
+    print(
+        f"linear-webhook-listener listening on http://{args.host}:{args.port}{args.path}",
+        flush=True,
+    )
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# linear-machine — polls Linear, dispatches self-managing agents
-# Machine.sh is a lightweight supervisor: dispatch + crash recovery + resume on human reply.
-# Agents manage their own Linear workflow via bin/linear-tool.
+# linear-machine — webhook-first supervisor with durable queue + issue session state
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -11,13 +9,42 @@ source "$SCRIPT_DIR/lib/provider.sh"
 source "$SCRIPT_DIR/lib/runner.sh"
 
 PID_FILE="$STATE_DIR/machine.pid"
+LISTENER_PID_FILE="$STATE_DIR/listener.pid"
 LOG_FILE="$STATE_DIR/machine.log"
+
+STATE_DB="${STATE_DB:-$STATE_DIR/state.db}"
+WORKER_ID="${WORKER_ID:-$(hostname)-$$}"
+WORKER_SLEEP_SECONDS="${WORKER_SLEEP_SECONDS:-2}"
+WORKER_BATCH_SIZE="${WORKER_BATCH_SIZE:-10}"
+LOCK_LEASE_SECONDS="${LOCK_LEASE_SECONDS:-900}"
+MAX_RETRIES="${MAX_RETRIES:-5}"
+RETRY_BACKOFF_SECONDS="${RETRY_BACKOFF_SECONDS:-60}"
+RECONCILER_INTERVAL="${RECONCILER_INTERVAL:-300}"
+ENABLE_RECONCILER="${ENABLE_RECONCILER:-1}"
+
+WEBHOOK_HOST="${WEBHOOK_HOST:-0.0.0.0}"
+WEBHOOK_PORT="${WEBHOOK_PORT:-8787}"
+WEBHOOK_PATH="${WEBHOOK_PATH:-/webhooks/linear}"
+WEBHOOK_MAX_AGE_SECONDS="${WEBHOOK_MAX_AGE_SECONDS:-300}"
+WEBHOOK_SECRET="${LINEAR_WEBHOOK_SECRET:-${WEBHOOK_SECRET:-}}"
 
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
 
-# ---------------------------------------------------------------------------
-# Environment helpers
-# ---------------------------------------------------------------------------
+log_event() {
+  local issue_id="$1" event_id="$2" action="$3" result="$4" duration_ms="$5" message="$6"
+  log "issue_id=${issue_id:-none} event_id=${event_id:-none} action=$action result=$result duration_ms=${duration_ms:-0} msg=${message:-none}"
+  store timeline-add --event-id "${event_id:-}" --issue-id "${issue_id:-}" \
+    --action "$action" --result "$result" --duration-ms "${duration_ms:-0}" --message "${message:-}" >/dev/null || true
+}
+
+store() {
+  "$SCRIPT_DIR/bin/state-store" --db "$STATE_DB" "$@"
+}
+
+store_init() {
+  mkdir -p "$STATE_DIR"
+  store init >/dev/null
+}
 
 read_config_var() {
   local file="$1" key="$2"
@@ -51,37 +78,29 @@ env_repo_path() {
   echo "$REPOS_DIR"
 }
 
-# ---------------------------------------------------------------------------
-# Workflow state resolution (for crash recovery)
-# ---------------------------------------------------------------------------
 resolve_state_id() {
   local team_id="$1" target_name="$2" state_dir="$3"
   local cache="$state_dir/workflow_states.json"
-
   if [ ! -f "$cache" ]; then
     linear_get_workflow_states "$team_id" | jq '.data.workflowStates.nodes' > "$cache"
   fi
-
   jq -r --arg name "$target_name" \
     '[.[] | select(.name | ascii_downcase == ($name | ascii_downcase))] | .[0].id // empty' \
     "$cache"
 }
 
-# ---------------------------------------------------------------------------
-# Prompt building
-# ---------------------------------------------------------------------------
 build_tool_docs() {
   cat <<'TOOLDOCS'
 ## Linear Tools
 
 You have the `linear-tool` command to manage this issue:
 
-  linear-tool assign              # assign this issue to yourself
-  linear-tool status "In Progress"  # update issue status
-  linear-tool status "In Review"    # mark ready for review
-  linear-tool status "Blocked"      # signal you need input (stops agent)
-  linear-tool comment "message"     # post a comment
-  linear-tool get-comments          # read recent comments
+  linear-tool assign                # assign this issue to yourself
+  linear-tool status "In Progress"   # update issue status
+  linear-tool status "In Review"     # mark ready for review
+  linear-tool status "Blocked"       # signal you need input (stops agent)
+  linear-tool comment "message"      # post a comment
+  linear-tool get-comments           # read recent comments
 
 ## Workflow
 
@@ -98,19 +117,14 @@ TOOLDOCS
 
 build_prompt() {
   local issue="$1" state_dir="$2" mode="$3"
-
   if [ "$mode" = "new" ]; then
-    local identifier title description state_name
+    local identifier title description state_name comments
     identifier=$(echo "$issue" | jq -r '.identifier')
     title=$(echo "$issue" | jq -r '.title')
     description=$(echo "$issue" | jq -r '.description // "No description provided."')
     state_name=$(echo "$issue" | jq -r '.state.name')
-
-    # Format recent comments
-    local comments=""
     comments=$(echo "$issue" | jq -r '
-      [.comments.nodes[] | "\(.user.displayName) (\(.createdAt)): \(.body)"]
-      | .[-5:] | .[]
+      [.comments.nodes[] | "\(.user.displayName) (\(.createdAt)): \(.body)"] | .[-10:] | .[]
     ' 2>/dev/null || true)
 
     cat > "$state_dir/prompt" <<PROMPT
@@ -130,8 +144,7 @@ ${comments:-"(none)"}
 
 $(build_tool_docs)
 PROMPT
-
-  elif [ "$mode" = "resume" ]; then
+  else
     local identifier latest_agent_update new_human_comments
     identifier=$(echo "$issue" | jq -r '.identifier')
     latest_agent_update="$4"
@@ -155,16 +168,12 @@ PROMPT
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Agent env file (Linear-specific vars for linear-tool)
-# ---------------------------------------------------------------------------
 write_agent_env() {
   local issue="$1" state_dir="$2"
   local issue_uuid team_id identifier
   issue_uuid=$(echo "$issue" | jq -r '.id')
   team_id=$(echo "$issue" | jq -r '.team.id')
   identifier=$(echo "$issue" | jq -r '.identifier')
-
   cat > "$state_dir/env.sh" <<ENV
 export LINEAR_API_KEY="$LINEAR_API_KEY"
 export LINEAR_ISSUE_ID="$issue_uuid"
@@ -185,13 +194,13 @@ resume_comment_bundle() {
     | ($last_agent.body // "") as $agent_body
     | ($all | map(select(.user.id != $aid and ($last_agent_ts == "" or .createdAt > $last_agent_ts)))) as $new_humans
     | {
-        last_agent_ts: $last_agent_ts,
         latest_agent_update: (
           if $last_agent_ts == "" then ""
           else ($agent_name + " (" + $last_agent_ts + "): " + $agent_body)
           end
         ),
         latest_human_ts: (($new_humans | last | .createdAt) // ""),
+        latest_human_comment_id: (($new_humans | last | .id) // ""),
         new_human_comments: (
           if ($new_humans | length) == 0 then ""
           else ($new_humans | map(.user.displayName + " (" + .createdAt + "): " + .body) | join("\n\n"))
@@ -201,360 +210,554 @@ resume_comment_bundle() {
   '
 }
 
-latest_human_comment_ts() {
-  local issue="$1"
-  echo "$issue" | jq -r --arg aid "$AGENT_USER_ID" '
-    ([.comments.nodes[]? | select(.user.id != $aid)] | sort_by(.createdAt) | last | .createdAt) // ""
-  '
+id_from_identifier() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g'
 }
 
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-main_loop() {
-  log "Polling every ${POLL_INTERVAL}s for issues assigned to agent ($AGENT_USER_ID)"
-  log "Agent type: $AGENT_TYPE"
-
-  while true; do
-    handle_finished_agents
-    poll_and_dispatch
-    sleep "$POLL_INTERVAL"
-  done
+safe_delete_dir() {
+  local dir="$1"
+  [ -d "$dir" ] || return 0
+  if command -v trash >/dev/null 2>&1; then
+    trash "$dir"
+  else
+    rm -rf "$dir"
+  fi
 }
 
-# ---------------------------------------------------------------------------
-# Phase 1: handle finished agents — crash recovery only
-# ---------------------------------------------------------------------------
+start_listener() {
+  [ -n "$WEBHOOK_SECRET" ] || {
+    echo "Missing LINEAR_WEBHOOK_SECRET/WEBHOOK_SECRET for webhook listener" >&2
+    exit 1
+  }
+  if [ -f "$LISTENER_PID_FILE" ] && kill -0 "$(cat "$LISTENER_PID_FILE")" 2>/dev/null; then
+    return 0
+  fi
+
+  nohup "$SCRIPT_DIR/bin/linear-webhook-listener" \
+    --host "$WEBHOOK_HOST" \
+    --port "$WEBHOOK_PORT" \
+    --path "$WEBHOOK_PATH" \
+    --db "$STATE_DB" \
+    --webhook-secret "$WEBHOOK_SECRET" \
+    --agent-name "${AGENT_DISPLAY_NAME:-francis}" \
+    --max-age-seconds "$WEBHOOK_MAX_AGE_SECONDS" \
+    >> "$LOG_FILE" 2>&1 &
+  echo "$!" > "$LISTENER_PID_FILE"
+  log "Listener started pid=$(cat "$LISTENER_PID_FILE") path=$WEBHOOK_PATH"
+}
+
+stop_listener() {
+  if [ -f "$LISTENER_PID_FILE" ]; then
+    local lpid
+    lpid=$(cat "$LISTENER_PID_FILE")
+    if kill -0 "$lpid" 2>/dev/null; then
+      kill "$lpid" 2>/dev/null || true
+    fi
+    rm -f "$LISTENER_PID_FILE"
+  fi
+}
+
+sync_session_runtime_cache() {
+  local issue_id="$1" state_dir="$2"
+  local fields
+  fields=$(jq -nc \
+    --arg sid "$(cat "$state_dir/session" 2>/dev/null || true)" \
+    --arg vm "$(cat "$state_dir/vm_name" 2>/dev/null || true)" \
+    --arg ssh "$(cat "$state_dir/ssh_dest" 2>/dev/null || true)" \
+    --arg st "$state_dir" \
+    '{active_session_id:$sid,vm_name:$vm,ssh_dest:$ssh,state_dir:$st}')
+  store upsert-session --issue-id "$issue_id" --fields "$fields" >/dev/null
+}
+
 handle_finished_agents() {
+  local state_dir
   for state_dir in "$STATE_DIR"/*/; do
     [ -d "$state_dir" ] || continue
-    local id
+    [ -f "$state_dir/issue_uuid" ] || continue
+    local id issue_uuid
     id=$(basename "$state_dir")
-    # Skip if agent is still running
+    issue_uuid=$(cat "$state_dir/issue_uuid")
+
     if runner_is_running "$id"; then
+      sync_session_runtime_cache "$issue_uuid" "$state_dir"
       continue
     fi
 
-    # Skip if not a tracked issue
-    [ -f "$state_dir/issue_uuid" ] || continue
-
-    # Skip if already handled (agent_state set)
-    [ -f "$state_dir/agent_state" ] && continue
-
-    # Skip if agent never started (no session recorded yet)
     [ -f "$state_dir/session" ] || continue
+    [ -f "$state_dir/agent_state" ] && continue
 
     local exit_code="0"
     [ -f "$state_dir/exit_code" ] && exit_code=$(cat "$state_dir/exit_code")
 
     if [ "$exit_code" = "0" ]; then
-      # Success — agent handled everything via linear-tool
       echo "done" > "$state_dir/agent_state"
-      log "Agent finished for $id (success)"
-
+      store upsert-session --issue-id "$issue_uuid" \
+        --fields '{"status":"done"}' >/dev/null
+      log "Agent finished for $id"
     elif [ "$exit_code" = "100" ]; then
-      # Blocked — agent signaled via linear-tool status "Blocked"
       echo "blocked" > "$state_dir/agent_state"
-      log "Agent blocked for $id (waiting for human reply)"
-
+      store upsert-session --issue-id "$issue_uuid" \
+        --fields '{"status":"blocked"}' >/dev/null
+      log "Agent blocked for $id"
     else
-      # Crash — unexpected exit, post error comment
       echo "crashed" > "$state_dir/agent_state"
-      local issue_uuid
-      issue_uuid=$(cat "$state_dir/issue_uuid")
-
       local err_snippet=""
       [ -f "$state_dir/agent.err" ] && err_snippet=$(tail -20 "$state_dir/agent.err")
-
-      linear_post_comment "$issue_uuid" \
-        "Agent crashed (exit code: $exit_code). Error output:
+      linear_post_comment "$issue_uuid" "Agent crashed (exit code: $exit_code). Error output:
 \`\`\`
 ${err_snippet:-no error output captured}
-\`\`\`" > /dev/null
+\`\`\`" > /dev/null || true
 
-      # Try to move to Blocked state
       local team_id=""
       [ -f "$state_dir/team_id" ] && team_id=$(cat "$state_dir/team_id")
       if [ -n "$team_id" ]; then
         local blocked_id
         blocked_id=$(resolve_state_id "$team_id" "Blocked" "$state_dir")
-        if [ -n "$blocked_id" ]; then
-          linear_set_status "$issue_uuid" "$blocked_id" > /dev/null
-        fi
+        [ -n "$blocked_id" ] && linear_set_status "$issue_uuid" "$blocked_id" > /dev/null || true
       fi
-
+      store upsert-session --issue-id "$issue_uuid" \
+        --fields "$(jq -nc --arg err "exit code $exit_code" '{status:"blocked",last_error:$err}')" >/dev/null
       log "CRASH: agent for $id exited with code $exit_code"
     fi
+
+    sync_session_runtime_cache "$issue_uuid" "$state_dir"
   done
 }
 
-clear_issue_state_dirs() {
-  local state_dir
-  for state_dir in "$STATE_DIR"/*/; do
-    [ -d "$state_dir" ] || continue
-    [ -f "$state_dir/issue_uuid" ] || [ -f "$state_dir/title" ] || [ -f "$state_dir/workdir" ] || continue
-    rm -rf "$state_dir"
-  done
+fetch_issue_context() {
+  local issue_id="$1"
+  linear_get_issue_context "$issue_id" | jq -c '.data.issue // empty'
 }
 
-# ---------------------------------------------------------------------------
-# Phase 2: poll Linear, dispatch or resume agents
-# ---------------------------------------------------------------------------
-poll_and_dispatch() {
-  local poll_file="$STATE_DIR/poll.json"
-  linear_poll_issues > "$poll_file" 2>/dev/null || return 0
+should_trigger_for_event() {
+  local event_json="$1" issue_json="$2"
+  local event_type actor_id assignee_id mention issue_assignee state_type state_name
+  event_type=$(echo "$event_json" | jq -r '.event_type // ""' | tr '[:upper:]' '[:lower:]')
+  actor_id=$(echo "$event_json" | jq -r '.actor_id // ""')
+  assignee_id=$(echo "$event_json" | jq -r '.assignee_id // ""')
+  mention=$(echo "$event_json" | jq -r '
+    if .contains_mention == true or .contains_mention == 1 or .contains_mention == "1" or .contains_mention == "true"
+    then "true"
+    else "false"
+    end
+  ')
+  issue_assignee=$(echo "$issue_json" | jq -r '.assignee.id // ""')
+  state_type=$(echo "$issue_json" | jq -r '.state.type // ""' | tr '[:upper:]' '[:lower:]')
+  state_name=$(echo "$issue_json" | jq -r '.state.name // ""' | tr '[:upper:]' '[:lower:]')
 
-  # Also poll @mentions if AGENT_DISPLAY_NAME is set
-  local mentions_file="$STATE_DIR/mentions.json"
-  if [ -n "${AGENT_DISPLAY_NAME:-}" ]; then
-    local mention_term
-    mention_term=$(echo "$AGENT_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]')
-    linear_poll_mentions "$mention_term" > "$mentions_file" 2>/dev/null || true
+  case "$state_type" in completed|canceled) return 1 ;; esac
+  case "$state_name" in done|canceled|cancelled) return 1 ;; esac
+  [ "$actor_id" = "$AGENT_USER_ID" ] && return 1
+
+  if [[ "$event_type" == "comment.create" ]] && [ "$mention" = "true" ]; then
+    return 0
   fi
-
-  # Process assigned issues + mentions, dedup by issue UUID.
-  # Dispatch if no session exists. Resume if session exists.
-  local seen=""
-  while IFS= read -r issue; do
-    local issue_uuid id
-    local state_type state_name
-    local project_id
-    state_type=$(echo "$issue" | jq -r '.state.type // empty')
-    state_name=$(echo "$issue" | jq -r '.state.name // empty')
-    project_id=$(echo "$issue" | jq -r '.project.id // empty')
-    case "$state_type" in
-      completed|canceled) continue ;;
-    esac
-    case "$(echo "$state_name" | tr '[:upper:]' '[:lower:]')" in
-      done|canceled|cancelled) continue ;;
-    esac
-    is_project_tracked "$project_id" || continue
-
-    issue_uuid=$(echo "$issue" | jq -r '.id')
-    id=$(echo "$issue" | jq -r '.identifier' | tr '[:upper:]' '[:lower:]')
-    # Dedup: skip if already seen this UUID in this cycle
-    case "$seen" in
-      *"$issue_uuid"*) continue ;;
-    esac
-    seen="$seen $issue_uuid"
-
-    # Skip if agent already running
-    if runner_is_running "$id"; then
-      continue
-    fi
-
-    local state_dir="$STATE_DIR/$id"
-    mkdir -p "$state_dir"
-
-    # Process each human comment trigger once per issue.
-    local latest_human_ts saved_ts
-    latest_human_ts=$(latest_human_comment_ts "$issue")
-    saved_ts=""
-    [ -f "$state_dir/posted_at" ] && saved_ts=$(cat "$state_dir/posted_at")
-    if [ -n "$latest_human_ts" ] && [ -n "$saved_ts" ] && ! [ "$latest_human_ts" \> "$saved_ts" ]; then
-      continue
-    fi
-
-    if [ -f "$state_dir/session" ]; then
-      check_and_resume "$issue" "$id" "$state_dir"
-    else
-      dispatch_new "$issue" "$id" "$state_dir"
-    fi
-  done < <({
-    jq -c '.data.issues.nodes // [] | .[]' "$poll_file" 2>/dev/null || true
-    if [ -n "${AGENT_DISPLAY_NAME:-}" ] && [ -f "$mentions_file" ]; then
-      jq -c '(.data.searchIssues.nodes // .data.issueSearch.nodes // []) | .[]' "$mentions_file" 2>/dev/null || true
-    fi
-  })
-}
-
-# ---------------------------------------------------------------------------
-# Dispatch: new issue
-# ---------------------------------------------------------------------------
-dispatch_new() {
-  local issue="$1" id="$2" state_dir="$3"
-  local issue_uuid title project_id team_id assignee_id latest_human_ts
-  issue_uuid=$(echo "$issue" | jq -r '.id')
-  title=$(echo "$issue" | jq -r '.title')
-  project_id=$(echo "$issue" | jq -r '.project.id // empty')
-  team_id=$(echo "$issue" | jq -r '.team.id')
-  assignee_id=$(echo "$issue" | jq -r '.assignee.id // empty')
-  latest_human_ts=$(latest_human_comment_ts "$issue")
-
-  # Resolve environment
-  local env_dir
-  env_dir=$(resolve_environment "$project_id")
-  local workdir
-  workdir=$(env_repo_path "$env_dir")
-
-  # Build prompt + agent env
-  write_agent_env "$issue" "$state_dir"
-  build_prompt "$issue" "$state_dir" "new"
-
-  # Save issue metadata + workdir (runner reads workdir from state dir)
-  echo "$issue_uuid" > "$state_dir/issue_uuid"
-  echo "$title" > "$state_dir/title"
-  echo "$team_id" > "$state_dir/team_id"
-  echo "$workdir" > "$state_dir/workdir"
-  echo "$assignee_id" > "$state_dir/last_assignee"
-  [ -n "$latest_human_ts" ] && echo "$latest_human_ts" > "$state_dir/posted_at"
-  [ -n "$project_id" ] && echo "$project_id" > "$state_dir/project_id"
-
-  local start_rc=0
-  set +e
-  runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "start"
-  start_rc=$?
-  set -e
-  if [ "$start_rc" -eq 0 ]; then
-    log "Dispatched $AGENT_TYPE for $id: $title (env: ${env_dir:-legacy})"
-  else
-    log "Dispatch failed for $id (infra/runtime start error)"
+  if [[ "$event_type" == "issue.update" ]] && [ "$assignee_id" = "$AGENT_USER_ID" ]; then
+    return 0
   fi
-}
-
-# ---------------------------------------------------------------------------
-# Resume: existing issue with new human comment
-# ---------------------------------------------------------------------------
-check_and_resume() {
-  local issue="$1" id="$2" state_dir="$3"
-  local issue_uuid
-  issue_uuid=$(echo "$issue" | jq -r '.id')
-
-  # Need a saved session to resume
-  [ -f "$state_dir/session" ] || return 0
-  local session_id
-  session_id=$(cat "$state_dir/session")
-  [ -n "$session_id" ] || return 0
-
-  # Collect all new human comments after the latest agent comment.
-  local bundle latest_human_ts latest_agent_update new_human_comments
-  bundle=$(resume_comment_bundle "$issue")
-  latest_human_ts=$(echo "$bundle" | jq -r '.latest_human_ts // empty')
-  latest_agent_update=$(echo "$bundle" | jq -r '.latest_agent_update // empty')
-  new_human_comments=$(echo "$bundle" | jq -r '.new_human_comments // empty')
-
-  # Re-assignment can also trigger resume even with no new comments.
-  local current_assignee last_assignee assigned_trigger=0
-  current_assignee=$(echo "$issue" | jq -r '.assignee.id // empty')
-  [ -f "$state_dir/last_assignee" ] && last_assignee=$(cat "$state_dir/last_assignee") || last_assignee=""
-  if [ "$current_assignee" = "$AGENT_USER_ID" ] && [ "$last_assignee" != "$AGENT_USER_ID" ]; then
-    assigned_trigger=1
-  fi
-
-  [ -n "$latest_human_ts" ] || [ "$assigned_trigger" -eq 1 ] || return 0
-
-  # Skip if we already processed this comment
-  local saved_ts=""
-  [ -f "$state_dir/posted_at" ] && saved_ts=$(cat "$state_dir/posted_at")
-  if [ "$assigned_trigger" -eq 0 ] && [ -n "$saved_ts" ] && ! [ "$latest_human_ts" \> "$saved_ts" ]; then
+  if [[ "$event_type" == "issue.assignment.synthetic" ]] && [ "$issue_assignee" = "$AGENT_USER_ID" ]; then
     return 0
   fi
 
-  # Resolve environment from saved project_id
-  local project_id=""
-  [ -f "$state_dir/project_id" ] && project_id=$(cat "$state_dir/project_id")
-  local env_dir
+  return 1
+}
+
+dispatch_new() {
+  local issue="$1" id="$2" state_dir="$3" issue_id="$4" event_id="$5"
+  local issue_uuid title project_id team_id assignee_id env_dir workdir
+  issue_uuid=$(echo "$issue" | jq -r '.id')
+  title=$(echo "$issue" | jq -r '.title')
+  project_id=$(echo "$issue" | jq -r '.project.id // empty')
+  team_id=$(echo "$issue" | jq -r '.team.id // empty')
+  assignee_id=$(echo "$issue" | jq -r '.assignee.id // empty')
+
   env_dir=$(resolve_environment "$project_id")
+  workdir=$(env_repo_path "$env_dir")
 
-  # Refresh agent env + build resume prompt
+  mkdir -p "$state_dir"
   write_agent_env "$issue" "$state_dir"
-  build_prompt "$issue" "$state_dir" "resume" "$latest_agent_update" "$new_human_comments"
-
-  # Save issue UUID (might already exist)
+  build_prompt "$issue" "$state_dir" "new"
   echo "$issue_uuid" > "$state_dir/issue_uuid"
-  echo "$current_assignee" > "$state_dir/last_assignee"
+  echo "$title" > "$state_dir/title"
+  echo "$team_id" > "$state_dir/team_id"
+  echo "$project_id" > "$state_dir/project_id"
+  echo "$workdir" > "$state_dir/workdir"
+  echo "$assignee_id" > "$state_dir/last_assignee"
 
-  # Record latest human comment timestamp so we don't re-process.
-  if [ -n "$latest_human_ts" ]; then
-    echo "$latest_human_ts" > "$state_dir/posted_at"
-  fi
+  local fields
+  fields=$(jq -nc \
+    --arg ident "$(echo "$issue" | jq -r '.identifier')" \
+    --arg status "running" \
+    --arg aid "$assignee_id" \
+    --arg pid "$project_id" \
+    --arg tid "$team_id" \
+    --arg st "$state_dir" \
+    --arg ev "$event_id" \
+    '{issue_identifier:$ident,status:$status,last_assignee_id:$aid,project_id:$pid,team_id:$tid,state_dir:$st,last_event_id:$ev}')
+  store upsert-session --issue-id "$issue_id" --fields "$fields" >/dev/null
 
-  # Clear previous agent state for fresh resume
   rm -f "$state_dir/exit_code" "$state_dir/agent_state"
 
-  local resume_rc=0
+  local rc=0
+  set +e
+  runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "start"
+  rc=$?
+  set -e
+
+  if [ "$rc" -eq 0 ]; then
+    sync_session_runtime_cache "$issue_id" "$state_dir"
+    return 0
+  fi
+  return 1
+}
+
+resume_issue() {
+  local issue="$1" id="$2" state_dir="$3" issue_id="$4" event_id="$5" forced_comment_id="$6"
+  local project_id current_assignee env_dir bundle latest_agent_update new_human_comments latest_human_ts latest_human_comment_id
+
+  project_id=$(echo "$issue" | jq -r '.project.id // empty')
+  current_assignee=$(echo "$issue" | jq -r '.assignee.id // empty')
+  env_dir=$(resolve_environment "$project_id")
+
+  bundle=$(resume_comment_bundle "$issue")
+  latest_agent_update=$(echo "$bundle" | jq -r '.latest_agent_update // empty')
+  new_human_comments=$(echo "$bundle" | jq -r '.new_human_comments // empty')
+  latest_human_ts=$(echo "$bundle" | jq -r '.latest_human_ts // empty')
+  latest_human_comment_id=$(echo "$bundle" | jq -r '.latest_human_comment_id // empty')
+
+  if [ -z "$new_human_comments" ] && [ -n "$forced_comment_id" ]; then
+    # Session exists but no incremental bundle (cold cache). Fall back to full recent context.
+    build_prompt "$issue" "$state_dir" "new"
+  else
+    build_prompt "$issue" "$state_dir" "resume" "$latest_agent_update" "$new_human_comments"
+  fi
+
+  write_agent_env "$issue" "$state_dir"
+  echo "$current_assignee" > "$state_dir/last_assignee"
+  [ -n "$latest_human_ts" ] && echo "$latest_human_ts" > "$state_dir/posted_at"
+  rm -f "$state_dir/exit_code" "$state_dir/agent_state"
+
+  local fields
+  fields=$(jq -nc \
+    --arg status "running" \
+    --arg aid "$current_assignee" \
+    --arg pid "$project_id" \
+    --arg ev "$event_id" \
+    --arg cid "${latest_human_comment_id:-$forced_comment_id}" \
+    --arg hts "$latest_human_ts" \
+    '{status:$status,last_assignee_id:$aid,project_id:$pid,last_event_id:$ev,last_processed_comment_id:$cid,last_human_comment_ts:$hts}')
+  store upsert-session --issue-id "$issue_id" --fields "$fields" >/dev/null
+
+  local rc=0
   set +e
   runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "resume"
-  resume_rc=$?
+  rc=$?
   set -e
-  if [ "$resume_rc" -eq 0 ]; then
-    log "Resumed $AGENT_TYPE for $id (new human comments detected)"
-  else
-    log "Resume failed for $id (infra/runtime start error)"
+
+  if [ "$rc" -eq 0 ]; then
+    sync_session_runtime_cache "$issue_id" "$state_dir"
+    return 0
+  fi
+  return 1
+}
+
+process_single_event() {
+  local event_json="$1"
+  local started_ms now_ms duration_ms
+  started_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
+
+  local event_id issue_id
+  event_id=$(echo "$event_json" | jq -r '.event_id')
+  issue_id=$(echo "$event_json" | jq -r '.issue_id // empty')
+  [ -n "$issue_id" ] || {
+    store mark-done --event-id "$event_id" >/dev/null
+    return 0
+  }
+
+  local lock
+  lock=$(store acquire-lock --issue-id "$issue_id" --owner "$WORKER_ID" --lease-sec "$LOCK_LEASE_SECONDS")
+  if [ "$(echo "$lock" | jq -r '.acquired')" != "true" ]; then
+    store mark-failed --event-id "$event_id" --error "issue lock busy" --retry --backoff-sec 20 >/dev/null
+    return 0
+  fi
+
+  local rc=0 err="" done_now=0
+  local issue
+  issue=$(fetch_issue_context "$issue_id")
+  if [ -z "$issue" ]; then
+    rc=1
+    err="issue_not_found"
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    local project_id
+    project_id=$(echo "$issue" | jq -r '.project.id // empty')
+    if ! is_project_tracked "$project_id"; then
+      log_event "$issue_id" "$event_id" "skip" "untracked_project" 0 "project not in mapping"
+      store mark-done --event-id "$event_id" >/dev/null
+      done_now=1
+    fi
+  fi
+
+  if [ "$rc" -eq 0 ] && [ "$done_now" -eq 0 ]; then
+    if ! should_trigger_for_event "$event_json" "$issue"; then
+      log_event "$issue_id" "$event_id" "skip" "not_triggered" 0 "event did not meet deterministic trigger rules"
+      store mark-done --event-id "$event_id" >/dev/null
+      done_now=1
+    fi
+  fi
+
+  if [ "$rc" -eq 0 ] && [ "$done_now" -eq 0 ]; then
+    local identifier id state_dir
+    identifier=$(echo "$issue" | jq -r '.identifier')
+    id=$(id_from_identifier "$identifier")
+    state_dir="$STATE_DIR/$id"
+
+    if runner_is_running "$id"; then
+      log_event "$issue_id" "$event_id" "skip" "already_running" 0 "runner already active for issue"
+      store mark-done --event-id "$event_id" >/dev/null
+      done_now=1
+    else
+      local active_session
+      active_session=$(store get-session --issue-id "$issue_id" | jq -r '.active_session_id // empty')
+      if [ -n "$active_session" ] || [ -f "$state_dir/session" ]; then
+        local forced_comment_id
+        forced_comment_id=$(echo "$event_json" | jq -r '.comment_id // empty')
+        if ! resume_issue "$issue" "$id" "$state_dir" "$issue_id" "$event_id" "$forced_comment_id"; then
+          rc=1
+          err="resume_failed"
+        else
+          log_event "$issue_id" "$event_id" "resume" "ok" 0 "agent resumed"
+        fi
+      else
+        if ! dispatch_new "$issue" "$id" "$state_dir" "$issue_id" "$event_id"; then
+          rc=1
+          err="dispatch_failed"
+        else
+          log_event "$issue_id" "$event_id" "dispatch" "ok" 0 "agent dispatched"
+        fi
+      fi
+    fi
+  fi
+
+  if [ "$rc" -eq 0 ] && [ "$done_now" -eq 0 ]; then
+    store mark-done --event-id "$event_id" >/dev/null
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    local retries
+    retries=$(echo "$event_json" | jq -r '.retry_count // 0')
+    if [ "$retries" -lt "$MAX_RETRIES" ]; then
+      store mark-failed --event-id "$event_id" --error "${err:-worker_error}" --retry --backoff-sec "$RETRY_BACKOFF_SECONDS" >/dev/null
+      log_event "$issue_id" "$event_id" "process" "retry" 0 "${err:-worker_error}"
+    else
+      store mark-failed --event-id "$event_id" --error "${err:-worker_error}" >/dev/null
+      log_event "$issue_id" "$event_id" "process" "failed" 0 "${err:-worker_error}"
+    fi
+  fi
+
+  store release-lock --issue-id "$issue_id" --owner "$WORKER_ID" >/dev/null || true
+  now_ms=$(python3 -c 'import time; print(int(time.time()*1000))')
+  duration_ms=$((now_ms - started_ms))
+  log_event "$issue_id" "$event_id" "process" "done" "$duration_ms" "worker cycle complete"
+}
+
+process_event_queue() {
+  local n=0
+  while [ "$n" -lt "$WORKER_BATCH_SIZE" ]; do
+    local claimed
+    claimed=$(store claim-next --worker-id "$WORKER_ID")
+    if [ "$(echo "$claimed" | jq -r '.claimed')" != "true" ]; then
+      break
+    fi
+    process_single_event "$claimed"
+    n=$((n + 1))
+  done
+}
+
+enqueue_synthetic_assignment() {
+  local issue="$1"
+  local issue_id identifier assignee_id event_json event_id
+  issue_id=$(echo "$issue" | jq -r '.id')
+  identifier=$(echo "$issue" | jq -r '.identifier // ""')
+  assignee_id=$(echo "$issue" | jq -r '.assignee.id // ""')
+  event_id="reconcile-assign-${issue_id}-$(date -u +%Y%m%d%H%M)"
+  event_json=$(jq -nc \
+    --arg event_id "$event_id" \
+    --arg issue_id "$issue_id" \
+    --arg ident "$identifier" \
+    --arg assignee "$assignee_id" \
+    '{event_id:$event_id,source:"reconciler",event_type:"issue.assignment.synthetic",issue_id:$issue_id,issue_identifier:$ident,assignee_id:$assignee,contains_mention:false,payload:{}}')
+  local res
+  res=$(store enqueue --event "$event_json")
+  if [ "$(echo "$res" | jq -r '.duplicate // false')" = "true" ]; then
+    log_event "$issue_id" "$event_id" "enqueue" "duplicate" 0 "reconciler assignment dedupe"
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Commands: start, stop, status
-# ---------------------------------------------------------------------------
+enqueue_synthetic_mentions() {
+  local issue="$1"
+  local issue_id identifier
+  issue_id=$(echo "$issue" | jq -r '.id')
+  identifier=$(echo "$issue" | jq -r '.identifier // ""')
+
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    local comment_id actor_id body
+    comment_id=$(echo "$c" | jq -r '.id // ""')
+    actor_id=$(echo "$c" | jq -r '.user.id // ""')
+    body=$(echo "$c" | jq -r '.body // ""')
+    [ "$actor_id" = "$AGENT_USER_ID" ] && continue
+    echo "$body" | jq -Rr --arg name "${AGENT_DISPLAY_NAME:-francis}" 'ascii_downcase | contains("@" + ($name | ascii_downcase))' | grep -q true || continue
+
+    local event_json event_id res
+    event_id="reconcile-comment-${comment_id}"
+    event_json=$(jq -nc \
+      --arg event_id "$event_id" \
+      --arg issue_id "$issue_id" \
+      --arg ident "$identifier" \
+      --arg comment_id "$comment_id" \
+      --arg actor_id "$actor_id" \
+      --arg body "$body" \
+      '{event_id:$event_id,source:"reconciler",event_type:"comment.create",issue_id:$issue_id,issue_identifier:$ident,comment_id:$comment_id,actor_id:$actor_id,contains_mention:true,mention_text:$body,payload:{}}')
+    res=$(store enqueue --event "$event_json")
+    if [ "$(echo "$res" | jq -r '.duplicate // false')" = "true" ]; then
+      log_event "$issue_id" "$event_id" "enqueue" "duplicate" 0 "reconciler mention dedupe"
+    fi
+  done < <(echo "$issue" | jq -c '.comments.nodes[]?')
+}
+
+run_reconciler_once() {
+  local poll_file="$STATE_DIR/reconciler-assigned.json"
+  linear_poll_issues > "$poll_file" 2>/dev/null || return 0
+
+  while IFS= read -r issue; do
+    local state_type state_name project_id assignee_id
+    state_type=$(echo "$issue" | jq -r '.state.type // ""' | tr '[:upper:]' '[:lower:]')
+    state_name=$(echo "$issue" | jq -r '.state.name // ""' | tr '[:upper:]' '[:lower:]')
+    project_id=$(echo "$issue" | jq -r '.project.id // ""')
+    assignee_id=$(echo "$issue" | jq -r '.assignee.id // ""')
+    case "$state_type" in completed|canceled) continue ;; esac
+    case "$state_name" in done|canceled|cancelled) continue ;; esac
+    is_project_tracked "$project_id" || continue
+    [ "$assignee_id" = "$AGENT_USER_ID" ] && enqueue_synthetic_assignment "$issue"
+  done < <(jq -c '.data.issues.nodes // [] | .[]' "$poll_file" 2>/dev/null || true)
+
+  if [ -n "${AGENT_DISPLAY_NAME:-}" ]; then
+    local mentions_file="$STATE_DIR/reconciler-mentions.json"
+    linear_poll_mentions "$(echo "$AGENT_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]')" > "$mentions_file" 2>/dev/null || true
+    while IFS= read -r issue; do
+      local project_id
+      project_id=$(echo "$issue" | jq -r '.project.id // ""')
+      is_project_tracked "$project_id" || continue
+      enqueue_synthetic_mentions "$issue"
+    done < <(jq -c '(.data.searchIssues.nodes // .data.issueSearch.nodes // []) | .[]' "$mentions_file" 2>/dev/null || true)
+  fi
+}
+
+run_reconciler_if_due() {
+  [ "$ENABLE_RECONCILER" = "1" ] || return 0
+  local marker="$STATE_DIR/reconciler.last"
+  local now last
+  now=$(date +%s)
+  last=0
+  [ -f "$marker" ] && last=$(cat "$marker")
+  if [ $((now - last)) -lt "$RECONCILER_INTERVAL" ]; then
+    return 0
+  fi
+  echo "$now" > "$marker"
+  run_reconciler_once
+}
+
+main_loop() {
+  log "Machine loop start: webhook-first + durable queue"
+  start_listener
+
+  trap 'stop_listener' EXIT INT TERM
+
+  while true; do
+    handle_finished_agents
+    process_event_queue
+    run_reconciler_if_due
+    sleep "$WORKER_SLEEP_SECONDS"
+  done
+}
+
 cmd_start() {
-  mkdir -p "$STATE_DIR"
+  store_init
 
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     echo "Already running (PID: $(cat "$PID_FILE"))"
     exit 1
   fi
 
-  # Launch detached so loop survives shell/session exits.
   nohup "$SCRIPT_DIR/machine.sh" run-loop > /dev/null 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
   echo "Started (PID: $pid). Log: $LOG_FILE"
-  echo "Use '$0 stop' to stop, '$0 status' to check agents."
+  echo "Webhook endpoint: http://$WEBHOOK_HOST:$WEBHOOK_PORT$WEBHOOK_PATH"
 }
 
 cmd_stop() {
-  local confirm_flag="${1:-}"
-  if [ "$confirm_flag" != "--yes" ]; then
-    echo "WARNING: Stopping linear-machine ends all active agent sessions."
-    echo "If resumed later, agents get Linear comment history but lose prior session memory/context."
-    if [ -t 0 ]; then
-      local ans
-      read -r -p "Type 'stop' to confirm, anything else to cancel: " ans
-      if [ "$ans" != "stop" ]; then
-        echo "Stop cancelled."
-        return 1
-      fi
-    else
-      echo "Non-interactive shell: re-run with '$0 stop --yes' to confirm."
-      return 1
-    fi
-  fi
-
   if [ -f "$PID_FILE" ]; then
     local pid
     pid=$(cat "$PID_FILE")
     if kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null
-      echo "Stopped main loop (PID: $pid)"
+      kill "$pid" 2>/dev/null || true
+      echo "Stopped machine worker (PID: $pid)"
     fi
     rm -f "$PID_FILE"
   else
     echo "Not running"
   fi
 
-  runner_stop_all
-  clear_issue_state_dirs
-  echo "Cleaned up agent sessions"
+  stop_listener
+}
+
+cmd_cleanup_issues() {
+  store_init
+  while IFS= read -r sess; do
+    [ -n "$sess" ] || continue
+    local issue_id state_dir id
+    issue_id=$(echo "$sess" | jq -r '.issue_id')
+    state_dir=$(echo "$sess" | jq -r '.state_dir // ""')
+    [ -n "$state_dir" ] || continue
+    id=$(basename "$state_dir")
+    runner_stop "$id" || true
+    safe_delete_dir "$state_dir"
+    store upsert-session --issue-id "$issue_id" --fields '{"status":"idle","active_session_id":"","vm_name":"","ssh_dest":""}' >/dev/null
+  done < <(store list-sessions | jq -c '.sessions[]?')
+  echo "Issue cleanup complete."
 }
 
 cmd_status() {
+  store_init
+
   echo "=== Linear Machine ==="
   if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-    echo "Loop: running (PID: $(cat "$PID_FILE"))"
+    echo "Worker: running (PID: $(cat "$PID_FILE"))"
   else
-    echo "Loop: stopped"
+    echo "Worker: stopped"
+  fi
+
+  if [ -f "$LISTENER_PID_FILE" ] && kill -0 "$(cat "$LISTENER_PID_FILE")" 2>/dev/null; then
+    echo "Listener: running (PID: $(cat "$LISTENER_PID_FILE")) http://$WEBHOOK_HOST:$WEBHOOK_PORT$WEBHOOK_PATH"
+  else
+    echo "Listener: stopped"
   fi
 
   echo ""
-  echo "=== Environments ==="
-  for env_dir in "$SCRIPT_DIR"/environments/*/; do
-    [ -d "$env_dir" ] || continue
-    local name repo
-    name=$(basename "$env_dir")
-    repo=$(head -1 "$env_dir/repo_path" 2>/dev/null | tr -d '[:space:]' || echo "(no repo_path)")
-    echo "  $name → $repo"
-  done
+  echo "=== Queue ==="
+  store queue-stats | jq -r '
+    "pending=\(.pending) processing=\(.processing) done=\(.done) failed=\(.failed) depth=\(.pending + .processing) dedupe_drops=\(.dedupe_drops) total=\(.total)",
+    "events_received_per_sec=\(.events_received_per_sec) dispatch_success=\(.dispatch_success) dispatch_fail=\(.dispatch_fail) comment_to_dispatch_latency_ms_avg=\(.comment_to_dispatch_latency_ms_avg // "n/a")"
+  '
+
+  echo ""
+  echo "=== Per-Issue Sessions ==="
+  local sessions
+  sessions=$(store list-sessions)
+  echo "$sessions" | jq -r '.sessions[]? | "\(.issue_identifier // .issue_id) issue_id=\(.issue_id) status=\(.status) session=\(.active_session_id // "") vm=\(.vm_name // "")"'
 
   echo ""
   echo "=== Active Agents ($RUNNER_TYPE) ==="
@@ -567,33 +770,69 @@ cmd_status() {
   fi
 
   echo ""
-  echo "=== Tracked Issues ==="
-  for state_dir in "$STATE_DIR"/*/; do
-    [ -d "$state_dir" ] || continue
-    local id
-    id=$(basename "$state_dir")
-    local title=""
-    [ -f "$state_dir/title" ] && title=$(cat "$state_dir/title")
-    local agent_state=""
-    [ -f "$state_dir/agent_state" ] && agent_state="[$(cat "$state_dir/agent_state")]"
-    local env_info=""
-    if [ -f "$state_dir/project_id" ]; then
-      local pid env_dir
-      pid=$(cat "$state_dir/project_id")
-      env_dir=$(resolve_environment "$pid")
-      [ -n "$env_dir" ] && env_info="[$(basename "$env_dir")]"
-    fi
-    echo "  $id: $title $env_info $agent_state"
-  done
+  echo "=== Orphaned Issue VMs ==="
+  local tracked_ids orphaned=0
+  tracked_ids=$(echo "$sessions" | jq -r '.sessions[]?.state_dir // empty | split("/") | last')
+  if [ -n "$agents" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      local id
+      id=$(echo "$line" | cut -d: -f1)
+      case $'\n'"$tracked_ids"$'\n' in
+        *$'\n'"$id"$'\n'*) ;;
+        *)
+        echo "  $line"
+        orphaned=1
+        ;;
+      esac
+    done <<< "$agents"
+  fi
+  if [ "$orphaned" -eq 0 ]; then
+    echo "  (none)"
+  fi
 }
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+cmd_debug_issue() {
+  local issue_ref="${1:-}"
+  [ -n "$issue_ref" ] || { echo "Usage: $0 debug issue <issue-id-or-identifier>"; return 1; }
+
+  local issue_id="$issue_ref"
+  if [[ "$issue_ref" =~ [A-Za-z] ]]; then
+    local matched
+    matched=$(store list-sessions | jq -r --arg ref "$issue_ref" '
+      .sessions[] | select((.issue_identifier // "") == $ref) | .issue_id
+    ' | head -1)
+    [ -n "$matched" ] && issue_id="$matched"
+  fi
+
+  echo "=== Session ==="
+  store get-session --issue-id "$issue_id" | jq .
+  echo ""
+  echo "=== Timeline ==="
+  store timeline-issue --issue-id "$issue_id" --limit 100 | jq .
+}
+
 case "${1:-status}" in
-  start)   cmd_start ;;
-  stop)    cmd_stop "${2:-}" ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
   run-loop) main_loop ;;
   status) cmd_status ;;
-  *)       echo "Usage: $0 {start|stop [--yes]|status}" ;;
+  cleanup)
+    if [ "${2:-}" = "--issues" ]; then
+      cmd_cleanup_issues
+    else
+      echo "Usage: $0 cleanup --issues"
+      exit 1
+    fi
+    ;;
+  debug)
+    if [ "${2:-}" = "issue" ]; then
+      cmd_debug_issue "${3:-}"
+    else
+      echo "Usage: $0 debug issue <issue-id-or-identifier>"
+      exit 1
+    fi
+    ;;
+  run-reconciler) run_reconciler_once ;;
+  *) echo "Usage: $0 {start|stop|status|cleanup --issues|debug issue <id>|run-reconciler}" ;;
 esac
