@@ -53,12 +53,18 @@ runner_start() {
     echo "$vm_name" > "$state_dir/vm_name"
     echo "$ssh_dest" > "$state_dir/ssh_dest"
 
-    # Create remote workdir and clone repo if configured
-    _exe_ssh "$ssh_dest" "mkdir -p $remote_workdir"
+    # Ensure remote repo exists when repo_url is configured.
+    # Keep this idempotent so restarts don't crash on existing directories.
     if [ -n "$env_dir" ] && [ -f "$env_dir/repo_url" ]; then
-      local repo_url
+      local repo_url remote_parent
       repo_url=$(tr -d '[:space:]' < "$env_dir/repo_url")
-      [ -n "$repo_url" ] && _exe_ssh "$ssh_dest" "git clone $repo_url $remote_workdir" 2>/dev/null
+      remote_parent="${remote_workdir%/*}"
+      if [ -n "$repo_url" ]; then
+        _exe_ssh "$ssh_dest" "mkdir -p $remote_parent"
+        _exe_ssh "$ssh_dest" "[ -d $remote_workdir/.git ] || git clone $repo_url $remote_workdir"
+      fi
+    else
+      _exe_ssh "$ssh_dest" "mkdir -p $remote_workdir"
     fi
 
     # Create remote structure
@@ -90,7 +96,9 @@ runner_start() {
     [ -n "$env_dir" ] && [ -x "$env_dir/setup.sh" ] && cmd="$cmd && ~/state/$id/env/setup.sh"
     cmd="$cmd && ~/adapters/${agent_type}.sh start ~/state/$id $remote_workdir"
 
-    _exe_ssh "$ssh_dest" "tmux new-session -d -s linear-$id $cmd"
+    local escaped_cmd
+    escaped_cmd=$(printf "%q" "$cmd")
+    _exe_ssh "$ssh_dest" "tmux new-session -d -s linear-$id bash -lc $escaped_cmd"
     _exe_spawn_watcher "$id" "$state_dir" "$ssh_dest"
 
   else
@@ -116,7 +124,9 @@ runner_start() {
     [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && cmd="$cmd && source ~/state/$id/env/env.sh"
     cmd="$cmd && ~/adapters/${agent_type}.sh resume ~/state/$id"
 
-    _exe_ssh "$ssh_dest" "tmux new-session -d -s linear-$id $cmd"
+    local escaped_cmd
+    escaped_cmd=$(printf "%q" "$cmd")
+    _exe_ssh "$ssh_dest" "tmux new-session -d -s linear-$id bash -lc $escaped_cmd"
     _exe_spawn_watcher "$id" "$state_dir" "$ssh_dest"
   fi
 }

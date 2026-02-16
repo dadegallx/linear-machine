@@ -282,7 +282,7 @@ poll_and_dispatch() {
   done < <({
     jq -c '.data.issues.nodes // [] | .[]' "$poll_file" 2>/dev/null || true
     if [ -n "${AGENT_DISPLAY_NAME:-}" ] && [ -f "$mentions_file" ]; then
-      jq -c '.data.issueSearch.nodes // [] | .[]' "$mentions_file" 2>/dev/null || true
+      jq -c '(.data.searchIssues.nodes // .data.issueSearch.nodes // []) | .[]' "$mentions_file" 2>/dev/null || true
     fi
   })
 }

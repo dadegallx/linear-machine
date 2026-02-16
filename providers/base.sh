@@ -7,7 +7,7 @@ provider_expand_home() {
       echo "$HOME"
       ;;
     "~/"*)
-      echo "$HOME/${1#~/}"
+      echo "$HOME/${1#\~/}"
       ;;
     *)
       echo "$1"
@@ -28,7 +28,7 @@ provider_sync_file() {
   remote_home=$(_exe_ssh "$ssh_dest" 'printf %s "$HOME"')
   case "$remote_path" in
     "~/"*)
-      remote_abs="$remote_home/${remote_path#~/}"
+      remote_abs="$remote_home/${remote_path#\~/}"
       ;;
     *)
       remote_abs="$remote_path"
