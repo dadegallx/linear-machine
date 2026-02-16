@@ -81,6 +81,9 @@ runner_start() {
       [ -x "$env_dir/setup.sh" ] && _exe_scp "$env_dir/setup.sh" "$ssh_dest:~/state/$id/env/"
     fi
 
+    # Sync provider credentials (Codex/Claude/etc.) before starting agent.
+    provider_sync_credentials "$ssh_dest"
+
     # Build remote command chain
     local cmd="export PATH=~/bin:\$PATH && source ~/state/$id/env.sh"
     [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && cmd="$cmd && source ~/state/$id/env/env.sh"
@@ -104,6 +107,9 @@ runner_start() {
 
     # Clear previous exit markers
     _exe_ssh "$ssh_dest" "rm -f ~/state/$id/exit_code ~/state/$id/agent_state"
+
+    # Refresh provider credentials before resuming agent session.
+    provider_sync_credentials "$ssh_dest"
 
     # Build remote command (no setup.sh on resume)
     local cmd="export PATH=~/bin:\$PATH && source ~/state/$id/env.sh"

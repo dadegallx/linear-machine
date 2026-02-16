@@ -70,6 +70,8 @@ AGENT_TYPE=codex    # OpenAI Codex (codex exec / resume)
 
 Both adapters expose the same interface: `start STATE_DIR WORKDIR` and `resume STATE_DIR`. Adding a new agent means writing one adapter script.
 
+Provider auth sync is modular too: each provider script implements `provider_sync_credentials SSH_DEST`, and remote runners call it before start/resume.
+
 ## Runners
 
 Runners control **where** agents execute. Adapters control **which** agent runs.
@@ -89,6 +91,12 @@ Agents run on managed VMs via [exe.dev](https://exe.dev). Each issue gets its ow
 ```bash
 RUNNER_TYPE=exe
 EXE_REPOS_DIR=~/repos    # where repos land on VMs (default)
+
+# Optional auth file overrides for remote auth injection:
+CODEX_AUTH_FILE=~/.codex/auth.json
+CODEX_REMOTE_AUTH_FILE=~/.codex/auth.json
+CLAUDE_AUTH_FILE=~/.claude/.credentials.json
+CLAUDE_REMOTE_AUTH_FILE=~/.claude/.credentials.json
 ```
 
 Per-environment, add a `repo_url` file so the runner knows what to clone:
@@ -99,6 +107,7 @@ environments/my-project/
 ```
 
 VM lifecycle: provision on dispatch, clone repo, sync state, run agent, sync results back, destroy on stop. VMs are reused on resume.
+Before each remote start/resume, the provider credential file is SCP-injected to the VM via `provider_sync_credentials`.
 
 ### Adding a runner
 
@@ -125,8 +134,13 @@ linear-machine/
 ├── adapters/
 │   ├── codex.sh         # codex exec / codex exec resume
 │   └── claude.sh        # claude -p / claude --resume
+├── providers/
+│   ├── base.sh          # shared credential sync helpers
+│   ├── codex.sh         # codex auth file sync
+│   └── claude.sh        # claude auth file sync
 ├── lib/
 │   ├── linear.sh        # Linear GraphQL API (curl + jq)
+│   ├── provider.sh      # Provider loader (auth sync contract)
 │   └── runner.sh        # Runner loader + contract validation
 ├── environments/        # Per-project config (mapping, repo paths, env vars)
 ├── bin/
