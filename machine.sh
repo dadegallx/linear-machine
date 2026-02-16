@@ -231,7 +231,9 @@ handle_finished_agents() {
     local id
     id=$(basename "$state_dir")
     # Skip if agent is still running
-    runner_is_running "$id" && continue
+    if runner_is_running "$id"; then
+      continue
+    fi
 
     # Skip if not a tracked issue
     [ -f "$state_dir/issue_uuid" ] || continue
@@ -335,7 +337,9 @@ poll_and_dispatch() {
     seen="$seen $issue_uuid"
 
     # Skip if agent already running
-    runner_is_running "$id" && continue
+    if runner_is_running "$id"; then
+      continue
+    fi
 
     local state_dir="$STATE_DIR/$id"
     mkdir -p "$state_dir"
