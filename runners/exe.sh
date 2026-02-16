@@ -186,7 +186,7 @@ runner_start() {
 
     # Build remote command chain
     local cmd="export PATH=$remote_bin_dir:\$PATH && source $remote_state_dir/env.sh"
-    [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && cmd="$cmd && source $remote_state_dir/env/env.sh"
+    [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && cmd="$cmd && source $remote_state_dir/env/env.sh || true"
     [ -n "$env_dir" ] && [ -x "$env_dir/setup.sh" ] && cmd="$cmd && $remote_state_dir/env/setup.sh"
     cmd="$cmd && $remote_adapters_dir/${agent_type}.sh start $remote_state_dir $remote_workdir"
 
@@ -222,7 +222,7 @@ runner_start() {
 
     # Build remote command (no setup.sh on resume)
     local cmd="export PATH=$remote_bin_dir:\$PATH && source $remote_state_dir/env.sh"
-    [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && cmd="$cmd && source $remote_state_dir/env/env.sh"
+    [ -n "$env_dir" ] && [ -f "$env_dir/env.sh" ] && cmd="$cmd && source $remote_state_dir/env/env.sh || true"
     cmd="$cmd && $remote_adapters_dir/${agent_type}.sh resume $remote_state_dir"
 
     _exe_write_remote_runner_script "$state_dir" "$ssh_dest" "$remote_state_dir" "$cmd"

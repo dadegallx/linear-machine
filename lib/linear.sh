@@ -27,7 +27,7 @@ linear_poll_mentions() {
   local payload
   payload=$(python3 -c "
 import json, sys
-q = 'query(\$term: String!) { searchIssues(term: \$term, includeComments: true, first: 20) { nodes { id identifier title description state { id name type } project { id name } team { id } assignee { id } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
+q = 'query(\$term: String!) { searchIssues(term: \$term, includeComments: true, first: 100) { nodes { id identifier title description state { id name type } project { id name } team { id } assignee { id } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
 print(json.dumps({'query': q, 'variables': {'term': sys.argv[1]}}))" "$agent_name")
   linear_gql "$payload"
 }

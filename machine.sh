@@ -307,7 +307,9 @@ poll_and_dispatch() {
   # Also poll @mentions if AGENT_DISPLAY_NAME is set
   local mentions_file="$STATE_DIR/mentions.json"
   if [ -n "${AGENT_DISPLAY_NAME:-}" ]; then
-    linear_poll_mentions "$AGENT_DISPLAY_NAME" > "$mentions_file" 2>/dev/null || true
+    local mention_term
+    mention_term=$(echo "$AGENT_DISPLAY_NAME" | tr '[:upper:]' '[:lower:]')
+    linear_poll_mentions "$mention_term" > "$mentions_file" 2>/dev/null || true
   fi
 
   # Process assigned issues + mentions, dedup by issue UUID.
