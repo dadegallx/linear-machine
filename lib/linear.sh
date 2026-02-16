@@ -15,19 +15,19 @@ linear_poll_issues() {
   local payload
   payload=$(python3 -c "
 import json, sys
-q = 'query(\$uid: ID!) { issues(filter: { assignee: { id: { eq: \$uid } } }) { nodes { id identifier title description state { id name } project { id name } team { id } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
+q = 'query(\$uid: ID!) { issues(filter: { assignee: { id: { eq: \$uid } } }) { nodes { id identifier title description state { id name } assignee { id } project { id name } team { id } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
 print(json.dumps({'query': q, 'variables': {'uid': sys.argv[1]}}))" "$AGENT_USER_ID")
   linear_gql "$payload"
 }
 
 linear_poll_mentions() {
-  # Fetch issues NOT assigned to agent where a recent comment mentions agent name.
+  # Fetch issues where recent content includes the agent name mention.
   # Returns same shape as linear_poll_issues for uniform handling.
   local agent_name="$1"
   local payload
   payload=$(python3 -c "
 import json, sys
-q = 'query(\$term: String!) { searchIssues(term: \$term, includeComments: true, filter: { assignee: { null: true } }, first: 20) { nodes { id identifier title description state { id name } project { id name } team { id } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
+q = 'query(\$term: String!) { searchIssues(term: \$term, includeComments: true, first: 20) { nodes { id identifier title description state { id name } project { id name } team { id } assignee { id } comments(last: 20) { nodes { id body createdAt user { id displayName } } } } } }'
 print(json.dumps({'query': q, 'variables': {'term': sys.argv[1]}}))" "$agent_name")
   linear_gql "$payload"
 }

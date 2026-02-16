@@ -77,11 +77,12 @@ You have the `linear-tool` command to manage this issue:
 
 ## Workflow
 
-1. Run `linear-tool assign` then `linear-tool status "In Progress"`
-2. Do the work
-3. Post progress updates with `linear-tool comment "..."`
-4. When done: `linear-tool comment "summary of changes"` then `linear-tool status "In Review"`
-5. If stuck: `linear-tool comment "your question"` then `linear-tool status "Blocked"` — then stop
+1. Read the latest human comments and context.
+2. Always post a Linear comment reply before implementing any changes.
+3. If you start execution, set `linear-tool status "In Progress"`.
+4. Keep posting progress updates with `linear-tool comment "..."`
+5. When done: `linear-tool comment "summary of changes"` then `linear-tool status "In Review"`
+6. If blocked: `linear-tool comment "your question"` then `linear-tool status "Blocked"` and stop.
 
 After setting "Blocked", finish your response immediately. You will be resumed when a human replies.
 TOOLDOCS
@@ -123,18 +124,19 @@ $(build_tool_docs)
 PROMPT
 
   elif [ "$mode" = "resume" ]; then
-    local identifier comment_author comment_body
+    local identifier latest_agent_update new_human_comments
     identifier=$(echo "$issue" | jq -r '.identifier')
-    comment_author="$4"
-    comment_body="$5"
+    latest_agent_update="$4"
+    new_human_comments="$5"
 
     cat > "$state_dir/prompt" <<PROMPT
 # Linear Issue: $identifier (resumed)
 
-## Human Reply
+## Latest Agent Comment
+${latest_agent_update:-"(none found)"}
 
-$comment_author wrote:
-$comment_body
+## New Human Comments (since latest agent comment)
+${new_human_comments:-"(none)"}
 
 ---
 
@@ -163,6 +165,32 @@ export LINEAR_TEAM_ID="$team_id"
 export AGENT_USER_ID="$AGENT_USER_ID"
 export LINEAR_STATE_DIR="$state_dir"
 ENV
+}
+
+resume_comment_bundle() {
+  local issue="$1"
+  echo "$issue" | jq -r --arg aid "$AGENT_USER_ID" '
+    (.comments.nodes // [] | sort_by(.createdAt)) as $all
+    | ($all | map(select(.user.id == $aid)) | last) as $last_agent
+    | ($last_agent.createdAt // "") as $last_agent_ts
+    | ($last_agent.user.displayName // "Agent") as $agent_name
+    | ($last_agent.body // "") as $agent_body
+    | ($all | map(select(.user.id != $aid and ($last_agent_ts == "" or .createdAt > $last_agent_ts)))) as $new_humans
+    | {
+        last_agent_ts: $last_agent_ts,
+        latest_agent_update: (
+          if $last_agent_ts == "" then ""
+          else ($agent_name + " (" + $last_agent_ts + "): " + $agent_body)
+          end
+        ),
+        latest_human_ts: (($new_humans | last | .createdAt) // ""),
+        new_human_comments: (
+          if ($new_humans | length) == 0 then ""
+          else ($new_humans | map(.user.displayName + " (" + .createdAt + "): " + .body) | join("\n\n"))
+          end
+        )
+      }
+  '
 }
 
 # ---------------------------------------------------------------------------
@@ -195,6 +223,9 @@ handle_finished_agents() {
 
     # Skip if already handled (agent_state set)
     [ -f "$state_dir/agent_state" ] && continue
+
+    # Skip if agent never started (no session recorded yet)
+    [ -f "$state_dir/session" ] || continue
 
     local exit_code="0"
     [ -f "$state_dir/exit_code" ] && exit_code=$(cat "$state_dir/exit_code")
@@ -253,14 +284,13 @@ poll_and_dispatch() {
     linear_poll_mentions "$AGENT_DISPLAY_NAME" > "$mentions_file" 2>/dev/null || true
   fi
 
-  # Process assigned issues + mentions, dedup by issue UUID
+  # Process assigned issues + mentions, dedup by issue UUID.
+  # Dispatch if no session exists. Resume if session exists.
   local seen=""
   while IFS= read -r issue; do
-    local issue_uuid id title state_name
+    local issue_uuid id
     issue_uuid=$(echo "$issue" | jq -r '.id')
     id=$(echo "$issue" | jq -r '.identifier' | tr '[:upper:]' '[:lower:]')
-    title=$(echo "$issue" | jq -r '.title')
-    state_name=$(echo "$issue" | jq -r '.state.name')
     # Dedup: skip if already seen this UUID in this cycle
     case "$seen" in
       *"$issue_uuid"*) continue ;;
@@ -273,12 +303,11 @@ poll_and_dispatch() {
     local state_dir="$STATE_DIR/$id"
     mkdir -p "$state_dir"
 
-    if [ "$state_name" = "Todo" ]; then
-      dispatch_new "$issue" "$id" "$state_dir"
-    elif [ "$state_name" = "In Review" ] || [ "$state_name" = "Blocked" ]; then
+    if [ -f "$state_dir/session" ]; then
       check_and_resume "$issue" "$id" "$state_dir"
+    else
+      dispatch_new "$issue" "$id" "$state_dir"
     fi
-    # Skip: In Progress (agent running or will be), Done, Cancelled, etc.
   done < <({
     jq -c '.data.issues.nodes // [] | .[]' "$poll_file" 2>/dev/null || true
     if [ -n "${AGENT_DISPLAY_NAME:-}" ] && [ -f "$mentions_file" ]; then
@@ -292,11 +321,12 @@ poll_and_dispatch() {
 # ---------------------------------------------------------------------------
 dispatch_new() {
   local issue="$1" id="$2" state_dir="$3"
-  local issue_uuid title project_id team_id
+  local issue_uuid title project_id team_id assignee_id
   issue_uuid=$(echo "$issue" | jq -r '.id')
   title=$(echo "$issue" | jq -r '.title')
   project_id=$(echo "$issue" | jq -r '.project.id // empty')
   team_id=$(echo "$issue" | jq -r '.team.id')
+  assignee_id=$(echo "$issue" | jq -r '.assignee.id // empty')
 
   # Resolve environment
   local env_dir
@@ -313,6 +343,7 @@ dispatch_new() {
   echo "$title" > "$state_dir/title"
   echo "$team_id" > "$state_dir/team_id"
   echo "$workdir" > "$state_dir/workdir"
+  echo "$assignee_id" > "$state_dir/last_assignee"
   [ -n "$project_id" ] && echo "$project_id" > "$state_dir/project_id"
 
   runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "start"
@@ -334,28 +365,29 @@ check_and_resume() {
   session_id=$(cat "$state_dir/session")
   [ -n "$session_id" ] || return 0
 
-  # Find latest comment NOT from the agent
-  local latest_human_comment
-  latest_human_comment=$(echo "$issue" | jq -c "
-    [.comments.nodes[] | select(.user.id != \"$AGENT_USER_ID\")]
-    | sort_by(.createdAt) | last // empty
-  ")
-  [ -z "$latest_human_comment" ] || [ "$latest_human_comment" = "null" ] && return 0
+  # Collect all new human comments after the latest agent comment.
+  local bundle latest_human_ts latest_agent_update new_human_comments
+  bundle=$(resume_comment_bundle "$issue")
+  latest_human_ts=$(echo "$bundle" | jq -r '.latest_human_ts // empty')
+  latest_agent_update=$(echo "$bundle" | jq -r '.latest_agent_update // empty')
+  new_human_comments=$(echo "$bundle" | jq -r '.new_human_comments // empty')
 
-  local comment_ts
-  comment_ts=$(echo "$latest_human_comment" | jq -r '.createdAt // empty')
-  [ -n "$comment_ts" ] || return 0
+  # Re-assignment can also trigger resume even with no new comments.
+  local current_assignee last_assignee assigned_trigger=0
+  current_assignee=$(echo "$issue" | jq -r '.assignee.id // empty')
+  [ -f "$state_dir/last_assignee" ] && last_assignee=$(cat "$state_dir/last_assignee") || last_assignee=""
+  if [ "$current_assignee" = "$AGENT_USER_ID" ] && [ "$last_assignee" != "$AGENT_USER_ID" ]; then
+    assigned_trigger=1
+  fi
+
+  [ -n "$latest_human_ts" ] || [ "$assigned_trigger" -eq 1 ] || return 0
 
   # Skip if we already processed this comment
   local saved_ts=""
   [ -f "$state_dir/posted_at" ] && saved_ts=$(cat "$state_dir/posted_at")
-  if [ -n "$saved_ts" ] && ! [ "$comment_ts" \> "$saved_ts" ]; then
+  if [ "$assigned_trigger" -eq 0 ] && [ -n "$saved_ts" ] && ! [ "$latest_human_ts" \> "$saved_ts" ]; then
     return 0
   fi
-
-  local comment_body comment_author
-  comment_body=$(echo "$latest_human_comment" | jq -r '.body')
-  comment_author=$(echo "$latest_human_comment" | jq -r '.user.displayName')
 
   # Resolve environment from saved project_id
   local project_id=""
@@ -365,20 +397,23 @@ check_and_resume() {
 
   # Refresh agent env + build resume prompt
   write_agent_env "$issue" "$state_dir"
-  build_prompt "$issue" "$state_dir" "resume" "$comment_author" "$comment_body"
+  build_prompt "$issue" "$state_dir" "resume" "$latest_agent_update" "$new_human_comments"
 
   # Save issue UUID (might already exist)
   echo "$issue_uuid" > "$state_dir/issue_uuid"
+  echo "$current_assignee" > "$state_dir/last_assignee"
 
-  # Record timestamp so we don't re-process this comment
-  date -u +%Y-%m-%dT%H:%M:%SZ > "$state_dir/posted_at"
+  # Record latest human comment timestamp so we don't re-process.
+  if [ -n "$latest_human_ts" ]; then
+    echo "$latest_human_ts" > "$state_dir/posted_at"
+  fi
 
   # Clear previous agent state for fresh resume
   rm -f "$state_dir/exit_code" "$state_dir/agent_state"
 
   runner_start "$id" "$state_dir" "$env_dir" "$AGENT_TYPE" "resume"
 
-  log "Resumed $AGENT_TYPE for $id (new comment from $comment_author)"
+  log "Resumed $AGENT_TYPE for $id (new human comments detected)"
 }
 
 # ---------------------------------------------------------------------------
@@ -392,7 +427,8 @@ cmd_start() {
     exit 1
   fi
 
-  main_loop &
+  # Launch detached so loop survives shell/session exits.
+  nohup "$SCRIPT_DIR/machine.sh" run-loop > /dev/null 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
   echo "Started (PID: $pid). Log: $LOG_FILE"
@@ -400,6 +436,23 @@ cmd_start() {
 }
 
 cmd_stop() {
+  local confirm_flag="${1:-}"
+  if [ "$confirm_flag" != "--yes" ]; then
+    echo "WARNING: Stopping linear-machine ends all active agent sessions."
+    echo "If resumed later, agents get Linear comment history but lose prior session memory/context."
+    if [ -t 0 ]; then
+      local ans
+      read -r -p "Type 'stop' to confirm, anything else to cancel: " ans
+      if [ "$ans" != "stop" ]; then
+        echo "Stop cancelled."
+        return 1
+      fi
+    else
+      echo "Non-interactive shell: re-run with '$0 stop --yes' to confirm."
+      return 1
+    fi
+  fi
+
   if [ -f "$PID_FILE" ]; then
     local pid
     pid=$(cat "$PID_FILE")
@@ -469,8 +522,9 @@ cmd_status() {
 # Entry point
 # ---------------------------------------------------------------------------
 case "${1:-status}" in
-  start)  cmd_start ;;
-  stop)   cmd_stop ;;
+  start)   cmd_start ;;
+  stop)    cmd_stop "${2:-}" ;;
+  run-loop) main_loop ;;
   status) cmd_status ;;
-  *)      echo "Usage: $0 {start|stop|status}" ;;
+  *)       echo "Usage: $0 {start|stop [--yes]|status}" ;;
 esac
